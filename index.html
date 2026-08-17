@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TTDProcess</title>
+    <!-- Paints the dark ground before React mounts, so the window never
+         flashes white on startup. Matches --bg-1 in theme.css. -->
+    <style>
+      html,
+      body,
+      #root {
+        background: #09090b;
+        margin: 0;
+        padding: 0;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

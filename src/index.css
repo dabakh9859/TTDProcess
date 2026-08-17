@@ -1,0 +1,17 @@
+@import 'tailwindcss';
+
+/* Theme tokens (--bg-1..5, --text-1..5, --border-1..3, accent and status
+   colours) recovered verbatim from the compiled bundle. The app reads some of
+   these at runtime via getComputedStyle — for the ECharts tooltips — so keep
+   the variable names as they are. */
+@import './theme/theme.css';
+
+/* Used by the loading placeholders. Tailwind already provides `spin`. */
+@keyframes shimmer {
+  0% {
+    background-position: -600px 0;
+  }
+  100% {
+    background-position: 600px 0;
+  }
+}

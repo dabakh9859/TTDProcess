@@ -1,0 +1,17 @@
+{
+  // Standalone config for the build tooling — the editor uses it for
+  // vite.config.ts. Not referenced by tsconfig.json, so `tsc --noEmit` on the
+  // app doesn't try to treat it as a composite project.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["vite.config.ts"]
+}

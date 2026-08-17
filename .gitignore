@@ -1,0 +1,35 @@
+# Artefacts de compilation Rust / Tauri (35 Go)
+src-tauri/target/
+src-tauri/gen/
+
+# Runtime Python embarqué : 4,6 Go, téléchargé à part (voir README)
+src-tauri/sidecars/python-embed/
+
+# Dépendances npm
+node_modules/
+
+# Données de recherche et rapports — ne quittent pas la machine
+Données et rapports/
+analyse-J/
+analyse-T600/
+rapport-T600/
+recovered/
+
+# Sorties de compilation LaTeX
+*.aux
+*.log
+*.out
+*.synctex.gz
+
+# Python
+__pycache__/
+*.pyc
+
+# Éditeurs et OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# NB : dist/ est volontairement versionné — c'est le frontend compilé, qui
+# permet de reconstruire l'application sans repasser par npm build.
