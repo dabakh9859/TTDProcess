@@ -37,7 +37,18 @@ pub async fn ai_train(
     // Train on a CALCULATED in-memory dataset (e.g. "t600") instead of xlsx:
     // export it to a temp Parquet and tell the sidecar to load it generically.
     if let Some(ds) = spec.get("dataset").and_then(|v| v.as_str()).map(str::to_string) {
-        let (path, num_cols) = export_dataset_for_training(&state, &ds)?;
+        let (path, num_cols, inserted) = export_dataset_for_training(&state, &ds)?;
+        if inserted > 0 {
+            let mut app_data = state.inner.lock().map_err(|e| e.to_string())?;
+            logger::add_log(
+                &mut app_data.logs,
+                LogLevel::Info,
+                format!(
+                    "Entraînement sur « {} » : {} pas de temps manquants insérés avant apprentissage, pour que le modèle apprenne sur la même grille que celle qu'il devra combler.",
+                    ds, inserted
+                ),
+            );
+        }
         let obj = spec.as_object_mut().ok_or("spec doit être un objet")?;
         obj.insert("files".into(), serde_json::json!([path]));
         obj.insert("generic_table".into(), serde_json::json!(true));
@@ -99,10 +110,34 @@ fn export_env_for_training(state: &State<'_, AppState>) -> Result<String, String
 fn export_dataset_for_training(
     state: &State<'_, AppState>,
     dataset: &str,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, Vec<String>, usize), String> {
     use polars::prelude::*;
-    let app = state.inner.lock().map_err(|e| e.to_string())?;
-    let df = dataset_ref(&app, dataset)?;
+    // Resolve exactly like `cleaning_complete_saits` does: the cleaned slot
+    // when there is one, the source otherwise. Reading the pristine import
+    // here would train the model on the very outliers the user just removed,
+    // then ask it to fill the frame those removals produced.
+    let df = {
+        let app = state.inner.lock().map_err(|e| e.to_string())?;
+        cleaned_slot_clone(&app, dataset)
+            .or_else(|_| dataset_ref(&app, dataset).map(|d| d.clone()))?
+    };
+
+    // Materialise the absent instants BEFORE training.
+    //
+    // Missing time steps used to be spliced in at fill time — after training.
+    // The model had therefore never seen those periods during learning: they
+    // simply were not rows yet. Asked to reconstruct them afterwards, it had no
+    // anchor for their level, and the filled stretch joined the real signal
+    // with a visible step at each end. Putting the reindex first is a pure
+    // ordering change: the model itself is untouched, it just learns on the
+    // same grid it will later be asked to complete.
+    let (df, inserted) = match crate::commands::cleaning_v2::reindex_on_grid(&df, dataset, None) {
+        Ok((out, n, _, _, _)) => (out, n),
+        // No detectable cadence (series too short or too irregular) — train on
+        // what we have rather than refusing outright.
+        Err(_) => (df, 0),
+    };
+    let df = &df;
 
     let mut num_cols: Vec<String> = Vec::new();
     for s in df.get_columns() {
@@ -124,7 +159,7 @@ fn export_dataset_for_training(
     let file = std::fs::File::create(&path).map_err(|e| format!("création du fichier temp: {}", e))?;
     let mut df_clone = df.clone();
     ParquetWriter::new(file).finish(&mut df_clone).map_err(|e| format!("écriture parquet: {}", e))?;
-    Ok((path.to_string_lossy().to_string(), num_cols))
+    Ok((path.to_string_lossy().to_string(), num_cols, inserted))
 }
 
 /// Write an arbitrary DataFrame to a fresh temp parquet — used to feed SAITS the
@@ -158,6 +193,16 @@ pub async fn ai_model_save(
 ) -> Result<Value, String> {
     let params = serde_json::json!({ "model_id": model_id, "path": path });
     sidecar.call(&app, "model_save", params).await
+}
+
+#[tauri::command]
+pub async fn ai_model_delete(
+    app: AppHandle,
+    sidecar: State<'_, AiSidecar>,
+    model_id: String,
+) -> Result<Value, String> {
+    let params = serde_json::json!({ "model_id": model_id });
+    sidecar.call(&app, "model_delete", params).await
 }
 
 #[tauri::command]
@@ -332,6 +377,85 @@ fn parse_imputed_ts(ts: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
 /// between consecutive predicted timestamps). Used for nearest-time merges so a
 /// dataset at a finer/raw cadence than the model grid still aligns — exact-millis
 /// matching would otherwise fill nothing ("Aucun trou comblé").
+/// "90" -> "1 h 30", for log lines about the gap-size filter.
+fn human_minutes(m: f64) -> String {
+    let total = m.round() as i64;
+    let (d, h, mi) = (total / 1440, (total % 1440) / 60, total % 60);
+    let mut out = String::new();
+    if d > 0 { out.push_str(&format!("{} j", d)); }
+    if h > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{} h", h)); }
+    if mi > 0 || out.is_empty() { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{} min", mi)); }
+    out
+}
+
+/// Median interval between consecutive samples, in milliseconds. Used to turn
+/// a run of missing samples into a real duration: a single missing row in a
+/// half-hourly series is a 30-minute gap, not a zero-length one.
+pub(crate) fn median_step_ms(datetimes: &[chrono::DateTime<chrono::Utc>]) -> i64 {
+    if datetimes.len() < 2 {
+        return 0;
+    }
+    let mut diffs: Vec<i64> = datetimes
+        .windows(2)
+        .map(|w| w[1].timestamp_millis() - w[0].timestamp_millis())
+        .filter(|d| *d > 0)
+        .collect();
+    if diffs.is_empty() {
+        return 0;
+    }
+    diffs.sort_unstable();
+    diffs[diffs.len() / 2]
+}
+
+/// Per-row mask: true when the row belongs to a run of consecutive missing
+/// samples whose DURATION falls inside `[min_ms, max_ms]` (either bound may be
+/// absent). Rows that are not missing are always false.
+///
+/// A run spanning rows `a..=b` is counted as `t[b] - t[a] + step`, so two
+/// missing rows in a half-hourly series read as a one-hour gap — which is what
+/// someone means by "fill gaps of up to one hour". Filtering whole runs rather
+/// than individual cells matters: half-filling a two-day hole would leave a
+/// series that looks continuous but is partly invented.
+pub(crate) fn gap_length_mask(
+    missing: &[bool],
+    datetimes: &[chrono::DateTime<chrono::Utc>],
+    step_ms: i64,
+    min_ms: Option<i64>,
+    max_ms: Option<i64>,
+) -> Vec<bool> {
+    let n = missing.len();
+    let mut keep = vec![false; n];
+    if min_ms.is_none() && max_ms.is_none() {
+        keep.copy_from_slice(missing);
+        return keep;
+    }
+    let mut i = 0usize;
+    while i < n {
+        if !missing[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && missing[i] {
+            i += 1;
+        }
+        let end = i - 1;
+        // Runs are contiguous in row order; without timestamps for them we
+        // cannot judge a duration, so leave such a run out of a filtered run.
+        let dur_ms = match (datetimes.get(start), datetimes.get(end)) {
+            (Some(a), Some(b)) => b.timestamp_millis() - a.timestamp_millis() + step_ms,
+            _ => continue,
+        };
+        let ok = min_ms.map_or(true, |m| dur_ms >= m) && max_ms.map_or(true, |m| dur_ms <= m);
+        if ok {
+            for k in start..=end {
+                keep[k] = true;
+            }
+        }
+    }
+    keep
+}
+
 fn sorted_preds(map: &HashMap<i64, f64>) -> (Vec<(i64, f64)>, i64) {
     let mut v: Vec<(i64, f64)> = map.iter().map(|(&k, &val)| (k, val)).collect();
     v.sort_by_key(|&(k, _)| k);
@@ -715,7 +839,7 @@ pub async fn cleaning_detect_saits(
     // re-exported too so it overrides any stale model.meta.env_file. Falls back
     // to the caller-provided files only if the dataset can't be exported.
     let detect_files = match export_dataset_for_training(&state, &dataset_key) {
-        Ok((path, _)) => vec![path],
+        Ok((path, _, _)) => vec![path],
         Err(_) => files.clone(),
     };
     let env_opt = export_env_for_training(&state).ok();
@@ -878,11 +1002,25 @@ pub async fn cleaning_complete_saits(
     files: Vec<String>,
     target_columns: Vec<String>,
     dataset: Option<String>,
+    // Restrict filling to gaps of a given size. Both bounds are in MINUTES and
+    // both are optional: `max` alone means "gaps up to this long", `min` alone
+    // "gaps at least this long", both together a window. Absent = fill every
+    // gap, which is what the command did before these existed.
+    min_gap_minutes: Option<f64>,
+    max_gap_minutes: Option<f64>,
 ) -> Result<Value, String> {
     use polars::prelude::*;
 
     if target_columns.is_empty() {
         return Err("Aucune colonne à compléter.".to_string());
+    }
+    let to_ms = |m: f64| -> i64 { (m * 60_000.0).round() as i64 };
+    let min_ms = min_gap_minutes.filter(|m| *m > 0.0).map(to_ms);
+    let max_ms = max_gap_minutes.filter(|m| *m > 0.0).map(to_ms);
+    if let (Some(a), Some(b)) = (min_ms, max_ms) {
+        if a > b {
+            return Err("La taille minimale de trou dépasse la taille maximale.".to_string());
+        }
     }
     let dataset_key = dataset.unwrap_or_else(|| "raw".to_string());
 
@@ -942,35 +1080,46 @@ pub async fn cleaning_complete_saits(
         let datetimes = crate::core::timestamp_utils::ts_col_to_datetimes(ts_col)
             .map_err(|e| format!("Impossible de parser TIMESTAMP: {}", e))?;
 
+        let step_ms = median_step_ms(&datetimes);
         for (col, map) in &maps {
             let mut vals = col_as_f64_opts(&df, col)?;
+            let missing_flags: Vec<bool> = (0..vals.len())
+                .map(|i| match vals.get(i) {
+                    Some(Some(x)) => !x.is_finite(),
+                    Some(None) => true,
+                    None => false,
+                })
+                .collect();
             // Gaps (NaN) present in this column BEFORE filling — lets the UI
             // show "% of gaps filled" per sensor.
-            let n_gaps = vals.iter().filter(|v| match v {
-                Some(x) => !x.is_finite(),
-                None => true,
-            }).count();
+            let n_gaps = missing_flags.iter().filter(|m| **m).count();
+            // Which of those the size filter lets through.
+            let eligible = gap_length_mask(&missing_flags, &datetimes, step_ms, min_ms, max_ms);
+            let n_eligible = eligible.iter().filter(|m| **m).count();
             let mut n_fill = 0usize;
             if !map.is_empty() {
                 let (pred_sorted, pred_tol) = sorted_preds(map);
                 for (i, dt) in datetimes.iter().enumerate() {
-                    let missing = match vals.get(i) {
-                        Some(Some(x)) => !x.is_finite(),
-                        Some(None) => true,
-                        None => false,
-                    };
-                    if missing {
-                        if let Some(v) = nearest_pred(&pred_sorted, dt.timestamp_millis(), pred_tol) {
-                            vals[i] = Some(v);
-                            n_fill += 1;
-                        }
+                    if !eligible.get(i).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(v) = nearest_pred(&pred_sorted, dt.timestamp_millis(), pred_tol) {
+                        vals[i] = Some(v);
+                        n_fill += 1;
                     }
                 }
             }
             df.replace(col, Series::new(col.as_str().into(), &vals))
                 .map_err(|e| format!("replace column {}: {}", col, e))?;
             total += n_fill;
-            per_column.push(serde_json::json!({ "column": col, "n_filled": n_fill, "n_gaps": n_gaps }));
+            per_column.push(serde_json::json!({
+                "column": col,
+                "n_filled": n_fill,
+                "n_gaps": n_gaps,
+                // Cells the size filter excluded — the difference between
+                // "the model had nothing to say" and "you asked me not to".
+                "n_out_of_range": n_gaps - n_eligible,
+            }));
             per_column_pairs.push((col.clone(), n_fill));
         }
 
@@ -987,10 +1136,16 @@ pub async fn cleaning_complete_saits(
             per_column: per_column_pairs,
             n_total: total,
         });
+        let filter_note = match (min_gap_minutes, max_gap_minutes) {
+            (None, None) => String::new(),
+            (None, Some(mx)) => format!(" (trous \u{2264} {})", human_minutes(mx)),
+            (Some(mn), None) => format!(" (trous \u{2265} {})", human_minutes(mn)),
+            (Some(mn), Some(mx)) => format!(" (trous de {} \u{e0} {})", human_minutes(mn), human_minutes(mx)),
+        };
         logger::add_log(
             &mut app_data.logs,
             LogLevel::Info,
-            format!("Gap Filling SAITS : {} trou(s) comblé(s) — aperçu, en attente d'application", total),
+            format!("Gap Filling SAITS : {} trou(s) comblé(s){} — aperçu, en attente d'application", total, filter_note),
         );
         rows
     };
@@ -1180,4 +1335,90 @@ pub async fn cleaning_restore_cells(
     crate::utils::session_persist::save(&app_data);
 
     Ok(serde_json::json!({ "restored": restored, "column": column }))
+}
+
+#[cfg(test)]
+mod gap_size_tests {
+    use super::*;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    /// `n` samples, one every `step_min` minutes, starting at a fixed instant.
+    fn ts(n: usize, step_min: i64) -> Vec<DateTime<Utc>> {
+        let t0 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        (0..n)
+            .map(|i| t0 + chrono::Duration::minutes(i as i64 * step_min))
+            .collect()
+    }
+
+    const MIN: i64 = 60_000;
+
+    #[test]
+    fn median_step_is_the_sampling_interval() {
+        assert_eq!(median_step_ms(&ts(10, 30)), 30 * MIN);
+        assert_eq!(median_step_ms(&ts(1, 30)), 0);
+    }
+
+    #[test]
+    fn no_bounds_keeps_every_gap() {
+        let missing = vec![false, true, true, false, true];
+        let keep = gap_length_mask(&missing, &ts(5, 30), 30 * MIN, None, None);
+        assert_eq!(keep, missing);
+    }
+
+    #[test]
+    fn a_run_counts_its_own_duration_not_the_span_between_its_ends() {
+        // Two missing half-hourly samples are a ONE HOUR gap, so a "gaps up to
+        // one hour" filter must let them through — the naive t[end]-t[start]
+        // would read 30 min, and t[next]-t[prev] would read 90.
+        let missing = vec![false, true, true, false];
+        let keep = gap_length_mask(&missing, &ts(4, 30), 30 * MIN, None, Some(60 * MIN));
+        assert_eq!(keep, vec![false, true, true, false]);
+    }
+
+    #[test]
+    fn a_run_one_sample_too_long_is_rejected_whole() {
+        // Three missing samples = 1 h 30 > 1 h: the WHOLE run is skipped, never
+        // partly filled.
+        let missing = vec![false, true, true, true, false];
+        let keep = gap_length_mask(&missing, &ts(5, 30), 30 * MIN, None, Some(60 * MIN));
+        assert_eq!(keep, vec![false; 5]);
+    }
+
+    #[test]
+    fn min_bound_excludes_the_short_runs() {
+        // One short run (30 min) and one long one (2 h); keep only >= 1 h.
+        let mut missing = vec![false; 12];
+        missing[1] = true;
+        for i in 5..9 { missing[i] = true; }
+        let keep = gap_length_mask(&missing, &ts(12, 30), 30 * MIN, Some(60 * MIN), None);
+        assert!(!keep[1]);
+        assert!(keep[5] && keep[6] && keep[7] && keep[8]);
+    }
+
+    #[test]
+    fn a_window_keeps_only_what_falls_inside_it() {
+        let mut missing = vec![false; 20];
+        missing[2] = true;                       // 30 min
+        for i in 6..10 { missing[i] = true; }    // 2 h
+        for i in 13..19 { missing[i] = true; }   // 3 h
+        let keep = gap_length_mask(&missing, &ts(20, 30), 30 * MIN, Some(60 * MIN), Some(150 * MIN));
+        assert!(!keep[2], "30 min gap is below the window");
+        assert!(keep[6] && keep[9], "2 h gap is inside the window");
+        assert!(!keep[13] && !keep[18], "3 h gap is above the window");
+    }
+
+    #[test]
+    fn a_run_touching_the_end_of_the_series_is_still_measured() {
+        let missing = vec![false, false, true, true];
+        let keep = gap_length_mask(&missing, &ts(4, 30), 30 * MIN, None, Some(60 * MIN));
+        assert_eq!(keep, vec![false, false, true, true]);
+    }
+
+    #[test]
+    fn human_minutes_reads_like_a_duration() {
+        assert_eq!(human_minutes(60.0), "1 h");
+        assert_eq!(human_minutes(90.0), "1 h 30 min");
+        assert_eq!(human_minutes(1440.0), "1 j");
+        assert_eq!(human_minutes(2880.0), "2 j");
+    }
 }

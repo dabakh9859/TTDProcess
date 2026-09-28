@@ -74,6 +74,19 @@ pub struct AppData {
     /// provenance pointer) this set is intentional, additive, and persisted
     /// across sessions. Cleared by a forced full run, a reset, or a new import.
     pub cleaning_locked_stages: Vec<String>,
+    /// Pipeline stages ("t600", "tslope", …) that were loaded DIRECTLY from a
+    /// file via the import page (`load_data` with a `target`), rather than
+    /// computed from raw. Such a stage is authoritative: the user brought in a
+    /// T600 they cleaned elsewhere and wants the chain continued from it, so
+    /// `run_pipeline` resumes at the furthest one instead of rebuilding it from
+    /// stale raw data. Cleared by a fresh raw import, a reset, or a forced run.
+    pub imported_stages: Vec<String>,
+    /// Which slot the most recent import landed in — `None` for a normal raw
+    /// import, `Some("t600")` and friends for a file loaded AS a stage. The
+    /// import page's column-quality panel takes no argument, so this is how it
+    /// knows to describe the file the user just loaded rather than `raw_data`,
+    /// which after a stage import still holds the previous, unrelated file.
+    pub last_import_target: Option<String>,
     /// One-shot pre-cleaning snapshot per dataset key. Captured the FIRST
     /// time we touch a slot so the UI can render a "before / after"
     /// comparison even after the slot has been overwritten in-place.
@@ -128,6 +141,8 @@ impl Default for AppData {
             cleaning_path: None,
             cleaning_target_columns: Vec::new(),
             cleaning_locked_stages: Vec::new(),
+            imported_stages: Vec::new(),
+            last_import_target: None,
             cleaning_pre_snapshots: HashMap::new(),
             pending_completion: None,
             advanced_groups: Vec::new(),

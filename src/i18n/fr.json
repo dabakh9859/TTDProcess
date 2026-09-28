@@ -588,6 +588,8 @@
   "detection.simple.target.helper": "Coche les colonnes que tu veux que le modèle apprenne à prédire — ce sont aussi celles qui seront nettoyées dans l'onglet Gap Filling.",
   "detection.simple.target.title": "Quoi nettoyer ?",
   "detection.simplePreview.clear": "Effacer les zones",
+  "detection.simplePreview.selectAll": "Tout sélectionner",
+  "detection.simplePreview.selectAllHint": "Couvre toute la période d'un seul tenant — tu peux ensuite retailler la zone à la souris.",
   "detection.simplePreview.empty": "Coche au moins une colonne pour voir l'aperçu",
   "detection.simplePreview.helper": "Un graphique par colonne cochée (chaque colonne a sa propre échelle Y, donc les amplitudes différentes restent lisibles). Clique-glisse directement sur le graphe pour peindre une zone d'entraînement — tu peux en ajouter plusieurs pour exclure les périodes douteuses (pics, capteur défaillant, irrigation). Le modèle apprendra sur l'union des zones violettes.",
   "detection.simplePreview.hiddenCols": "(+{count} colonne(s) masquée(s) pour la lisibilité)",

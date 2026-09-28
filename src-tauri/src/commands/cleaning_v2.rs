@@ -96,7 +96,7 @@ fn dataset_ref<'a>(
 // =============================================================================
 
 #[tauri::command]
-pub fn cleaning_list_columns(
+pub async fn cleaning_list_columns(
     state: State<'_, AppState>,
     dataset: String,
 ) -> Result<serde_json::Value, String> {
@@ -569,6 +569,285 @@ pub async fn cleaning_time_gaps(
 /// the holes, which keeps the series' natural jitter intact (snapping
 /// everything onto a perfect grid would displace the ~2 000 rows that sit at
 /// 25/35/38 min offsets).
+/// Per-point origin flag — convention C5 of the processing report:
+///
+/// | code | meaning |
+/// |---|---|
+/// | 0 | measured |
+/// | 1 | removed by cleaning, then filled |
+/// | 2 | absent at acquisition, then filled |
+/// | 3 | rejected by a plausibility filter (reserved — no such filter yet) |
+/// | 4 | not filled |
+///
+/// Derived rather than recorded. The pristine pre-cleaning snapshot plus the
+/// presence of a row's instant in it carry everything needed, so no mutation
+/// site has to be instrumented and a session cleaned before this existed still
+/// reports correctly.
+///
+/// With no snapshot (nothing was ever cleaned) every present value reads 0 and
+/// every hole 4, which is exactly right.
+pub(crate) fn origin_flag_frame(
+    working: &DataFrame,
+    pristine: &DataFrame,
+    columns: &[String],
+) -> Result<DataFrame, String> {
+    use polars::prelude::*;
+    use std::collections::HashMap;
+
+    let w_ms = row_millis(working)?;
+    let p_ms = row_millis(pristine)?;
+    let index: HashMap<i64, usize> = p_ms.iter().enumerate().map(|(i, ms)| (*ms, i)).collect();
+
+    let as_f64 = |df: &DataFrame, name: &str| -> Option<Vec<Option<f64>>> {
+        df.column(name)
+            .ok()
+            .and_then(|s| s.cast(&DataType::Float64).ok())
+            .and_then(|s| s.f64().ok().map(|ca| ca.into_iter().collect()))
+    };
+
+    let mut out: Vec<Series> = Vec::with_capacity(columns.len() + 1);
+    out.push(
+        working
+            .column("TIMESTAMP")
+            .map_err(|e| e.to_string())?
+            .clone(),
+    );
+
+    for name in columns {
+        let cur = match as_f64(working, name) {
+            Some(v) => v,
+            None => continue,
+        };
+        let pri = as_f64(pristine, name);
+        let mut flags: Vec<u32> = Vec::with_capacity(w_ms.len());
+        for (i, ms) in w_ms.iter().enumerate() {
+            let c = cur.get(i).copied().flatten().filter(|v| v.is_finite());
+            let flag = match index.get(ms) {
+                // The instant is absent from the pristine frame: this row was
+                // spliced into the time grid afterwards.
+                None => if c.is_some() { 2 } else { 4 },
+                Some(&pi) => {
+                    let p = pri
+                        .as_ref()
+                        .and_then(|v| v.get(pi).copied().flatten())
+                        .filter(|v| v.is_finite());
+                    match (p, c) {
+                        (_, None) => 4,
+                        (None, Some(_)) => 2,
+                        (Some(a), Some(b)) if a == b => 0,
+                        (Some(_), Some(_)) => 1,
+                    }
+                }
+            };
+            flags.push(flag);
+        }
+        let fname = format!("{}_flag", name);
+        out.push(Series::new(fname.as_str().into(), flags));
+    }
+    DataFrame::new(out).map_err(|e| e.to_string())
+}
+
+/// Numeric sensor columns of a frame — everything but TIMESTAMP.
+fn sensor_columns(df: &DataFrame) -> Vec<String> {
+    df.get_columns()
+        .iter()
+        .filter(|s| !s.name().eq_ignore_ascii_case("TIMESTAMP"))
+        .filter(|s| s.dtype().is_numeric())
+        .map(|s| s.name().to_string())
+        .collect()
+}
+
+/// Resolve the working frame, its pristine counterpart and the columns to flag.
+fn flag_inputs(
+    app: &crate::state::AppData,
+    key: &str,
+    columns: Option<Vec<String>>,
+) -> Result<(DataFrame, DataFrame, Vec<String>), String> {
+    let working = working_df(app, key)?;
+    // No snapshot means nothing was ever cleaned on this slot: the frame is its
+    // own pristine version.
+    let pristine = app
+        .cleaning_pre_snapshots
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| working.clone());
+    let cols = match columns {
+        Some(c) if !c.is_empty() => c,
+        _ => sensor_columns(&working),
+    };
+    Ok((working, pristine, cols))
+}
+
+/// Count the origin flags (C5) per column, plus the filled fraction the report
+/// has to publish alongside every cumulative value (convention C4).
+#[tauri::command]
+pub async fn cleaning_origin_flags(
+    state: State<'_, AppState>,
+    dataset: Option<String>,
+    columns: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    let key = dataset.unwrap_or_else(|| "raw".to_string());
+    let (working, pristine, cols) = {
+        let app = state.inner.lock().map_err(|e| e.to_string())?;
+        flag_inputs(&app, &key, columns)?
+    };
+
+    let key_for_task = key.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        let flags = origin_flag_frame(&working, &pristine, &cols)?;
+        let mut per_column = Vec::with_capacity(cols.len());
+        let (mut t0, mut t1, mut t2, mut t4) = (0usize, 0usize, 0usize, 0usize);
+        for name in &cols {
+            let fname = format!("{}_flag", name);
+            let Ok(col) = flags.column(&fname) else { continue };
+            let ca = col.u32().map_err(|e| e.to_string())?;
+            let (mut c0, mut c1, mut c2, mut c4) = (0usize, 0usize, 0usize, 0usize);
+            for v in ca.into_iter().flatten() {
+                match v {
+                    0 => c0 += 1,
+                    1 => c1 += 1,
+                    2 => c2 += 1,
+                    _ => c4 += 1,
+                }
+            }
+            let present = c0 + c1 + c2;
+            let filled = c1 + c2;
+            per_column.push(serde_json::json!({
+                "column": name,
+                "measured": c0,
+                "cleaned_then_filled": c1,
+                "absent_then_filled": c2,
+                "not_filled": c4,
+                // Share of the PUBLISHED values that come from the model —
+                // this is the number convention C4 asks to print next to every
+                // cumulative figure.
+                "filled_fraction": if present > 0 { filled as f64 / present as f64 } else { 0.0 },
+            }));
+            t0 += c0; t1 += c1; t2 += c2; t4 += c4;
+        }
+        let present = t0 + t1 + t2;
+        Ok(serde_json::json!({
+            "dataset": key_for_task,
+            "n_rows": flags.height(),
+            "per_column": per_column,
+            "total": {
+                "measured": t0,
+                "cleaned_then_filled": t1,
+                "absent_then_filled": t2,
+                "not_filled": t4,
+                "filled_fraction": if present > 0 { (t1 + t2) as f64 / present as f64 } else { 0.0 },
+            },
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    Ok(out)
+}
+
+/// Write the origin flags to CSV: TIMESTAMP + one `<sensor>_flag` column.
+#[tauri::command]
+pub async fn export_origin_flags(
+    state: State<'_, AppState>,
+    dataset: Option<String>,
+    columns: Option<Vec<String>>,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    let key = dataset.unwrap_or_else(|| "raw".to_string());
+    let (working, pristine, cols) = {
+        let app = state.inner.lock().map_err(|e| e.to_string())?;
+        flag_inputs(&app, &key, columns)?
+    };
+
+    let out_path = path.clone();
+    let n = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let flags = origin_flag_frame(&working, &pristine, &cols)?;
+        crate::core::data_loader::export_to_csv(&flags, &out_path).map_err(|e| e.to_string())?;
+        Ok(flags.height())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let mut app = state.inner.lock().map_err(|e| e.to_string())?;
+    logger::add_log(
+        &mut app.logs,
+        LogLevel::Success,
+        format!("Drapeaux d'origine de « {} » exportés ({} lignes) : {}", key, n, path),
+    );
+    Ok(serde_json::json!({ "dataset": key, "n_rows": n, "path": path }))
+}
+
+/// Splice the missing instants of a series back onto its own time grid.
+///
+/// Returns `(frame, n_inserted, step_seconds, n_before, n_after)`. Existing
+/// rows are never moved — their own jitter is preserved — and the inserted rows
+/// carry NULL in every column but TIMESTAMP.
+///
+/// Extracted from `cleaning_reindex_time` so the SAITS training export can run
+/// the same thing: a model trained on a frame whose holes are absent has never
+/// seen those periods, and reconstructs them at the wrong level when they are
+/// materialised later, at fill time. Training and filling must see the same
+/// grid.
+pub(crate) fn reindex_on_grid(
+    df: &DataFrame,
+    key: &str,
+    step_seconds: Option<i64>,
+) -> Result<(DataFrame, usize, i64, usize, usize), String> {
+    use polars::prelude::*;
+    let ms = row_millis(df)?;
+    let n_before = ms.len();
+    if n_before < 3 {
+        return Err("Série trop courte pour déduire un pas.".into());
+    }
+    let grid = grid_for(df, key, &ms, step_seconds)?;
+    let step = match &grid {
+        Grid::Fixed(s) => *s,
+        Grid::Clock { period_s, .. } => *period_s,
+    };
+
+    // Build the output row plan: Some(i) = existing row i, None = a row to
+    // materialise at `ts`.
+    let mut idx: Vec<Option<IdxSize>> = Vec::with_capacity(n_before + 8192);
+    let mut ts_out: Vec<i64> = Vec::with_capacity(n_before + 8192);
+    for i in 0..n_before {
+        idx.push(Some(i as IdxSize));
+        ts_out.push(ms[i]);
+        if i + 1 >= n_before {
+            break;
+        }
+        for t in grid.instants_between(&ms, i) {
+            idx.push(None);
+            ts_out.push(t);
+        }
+    }
+    let inserted = idx.iter().filter(|o| o.is_none()).count();
+    if inserted == 0 {
+        return Ok((df.clone(), 0, step, n_before, n_before));
+    }
+
+    // `take` with a null-carrying index gathers rows and yields NULL everywhere
+    // the index is null — dtype-agnostic, so every column gets a proper
+    // missing value.
+    let idx_ca = IdxCa::from_iter(idx.iter().copied());
+    let mut out = df
+        .take(&idx_ca)
+        .map_err(|e| format!("Insertion des lignes manquantes: {}", e))?;
+
+    // The gathered TIMESTAMP is null on inserted rows — write the real instants
+    // back, preserving the column's original dtype.
+    let ts_dtype = df.column("TIMESTAMP").map_err(|e| e.to_string())?.dtype().clone();
+    let ts_series = Series::new("TIMESTAMP".into(), &ts_out)
+        .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))
+        .map_err(|e| format!("cast TIMESTAMP: {}", e))?
+        .cast(&ts_dtype)
+        .map_err(|e| format!("cast TIMESTAMP -> {:?}: {}", ts_dtype, e))?;
+    out.replace("TIMESTAMP", ts_series)
+        .map_err(|e| format!("replace TIMESTAMP: {}", e))?;
+
+    let n_after = out.height();
+    Ok((out, inserted, step, n_before, n_after))
+}
+
 #[tauri::command]
 pub async fn cleaning_reindex_time(
     state: State<'_, AppState>,
@@ -586,60 +865,9 @@ pub async fn cleaning_reindex_time(
 
     let key_for_task = key.clone();
     let (df_out, inserted, step, n_before, n_after) =
-        tokio::task::spawn_blocking(move || -> Result<(DataFrame, usize, i64, usize, usize), String> {
-            use polars::prelude::*;
-            let key = key_for_task;
-            let ms = row_millis(&df)?;
-            let n_before = ms.len();
-            if n_before < 3 { return Err("Série trop courte pour déduire un pas.".into()); }
-            let grid = grid_for(&df, &key, &ms, step_seconds)?;
-            let step = match &grid {
-                Grid::Fixed(s) => *s,
-                Grid::Clock { period_s, .. } => *period_s,
-            };
-
-            // Build the output row plan: Some(i) = existing row i, None = a row
-            // to materialise at `ts`. Existing rows are never moved, so the
-            // series' own jitter is preserved — we only splice into the holes.
-            let mut idx: Vec<Option<IdxSize>> = Vec::with_capacity(n_before + 8192);
-            let mut ts_out: Vec<i64> = Vec::with_capacity(n_before + 8192);
-            for i in 0..n_before {
-                idx.push(Some(i as IdxSize));
-                ts_out.push(ms[i]);
-                if i + 1 >= n_before { break; }
-                for t in grid.instants_between(&ms, i) {
-                    idx.push(None);
-                    ts_out.push(t);
-                }
-            }
-            let inserted = idx.iter().filter(|o| o.is_none()).count();
-            if inserted == 0 {
-                return Ok((df, 0, step, n_before, n_before));
-            }
-
-            // `take` with a null-carrying index gathers rows and yields NULL
-            // everywhere the index is null — dtype-agnostic, so every column
-            // (floats, ints, strings) gets a proper missing value.
-            let idx_ca = IdxCa::from_iter(idx.iter().copied());
-            let mut out = df.take(&idx_ca)
-                .map_err(|e| format!("Insertion des lignes manquantes: {}", e))?;
-
-            // The gathered TIMESTAMP is null on inserted rows — write the real
-            // instants back, preserving the column's original dtype.
-            let ts_dtype = df.column("TIMESTAMP").map_err(|e| e.to_string())?.dtype().clone();
-            let ts_series = Series::new("TIMESTAMP".into(), &ts_out)
-                .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))
-                .map_err(|e| format!("cast TIMESTAMP: {}", e))?
-                .cast(&ts_dtype)
-                .map_err(|e| format!("cast TIMESTAMP -> {:?}: {}", ts_dtype, e))?;
-            out.replace("TIMESTAMP", ts_series)
-                .map_err(|e| format!("replace TIMESTAMP: {}", e))?;
-
-            let n_after = out.height();
-            Ok((out, inserted, step, n_before, n_after))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        tokio::task::spawn_blocking(move || reindex_on_grid(&df, &key_for_task, step_seconds))
+            .await
+            .map_err(|e| e.to_string())??;
 
     {
         let mut app = state.inner.lock().map_err(|e| e.to_string())?;
@@ -812,15 +1040,91 @@ pub async fn cleaning_run_classical(
 // they select columns + a fill method (linear / ffill / bfill / rolling mean)
 // and we bridge whatever NaN holes already exist. No model training needed.
 
+/// Undo the fills that landed in gaps outside the requested size window.
+///
+/// The classical methods fill every hole they can reach; rather than teach
+/// each of them about gap sizes, let them run, then put the original NaN back
+/// wherever the hole was too short or too long. Whole runs are reverted, never
+/// parts of one, and the report's counts are corrected to what actually stays.
+fn revert_out_of_range_fills(
+    original: &DataFrame,
+    filled: &mut DataFrame,
+    report: &mut GapFillReport,
+    columns: &[String],
+    min_ms: Option<i64>,
+    max_ms: Option<i64>,
+) -> Result<(), String> {
+    use polars::prelude::*;
+    let ts = original
+        .column("TIMESTAMP")
+        .map_err(|e| format!("Colonne TIMESTAMP requise pour filtrer par taille de trou: {}", e))?;
+    let datetimes = crate::core::timestamp_utils::ts_col_to_datetimes(ts)
+        .map_err(|e| format!("Impossible de parser TIMESTAMP: {}", e))?;
+    let step_ms = crate::commands::ai::median_step_ms(&datetimes);
+
+    let as_f64 = |df: &DataFrame, name: &str| -> Option<Vec<Option<f64>>> {
+        df.column(name)
+            .ok()
+            .and_then(|s| s.cast(&DataType::Float64).ok())
+            .and_then(|s| s.f64().ok().map(|ca| ca.into_iter().collect()))
+    };
+
+    for name in columns {
+        let (Some(before), Some(mut after)) = (as_f64(original, name), as_f64(filled, name)) else {
+            continue;
+        };
+        let missing: Vec<bool> = before
+            .iter()
+            .map(|v| v.map_or(true, |x| !x.is_finite()))
+            .collect();
+        let eligible = crate::commands::ai::gap_length_mask(&missing, &datetimes, step_ms, min_ms, max_ms);
+        let mut reverted = 0usize;
+        for i in 0..after.len() {
+            let was_filled = missing[i] && after[i].is_some_and(|x| x.is_finite());
+            if was_filled && !eligible[i] {
+                after[i] = None;
+                reverted += 1;
+            }
+        }
+        if reverted == 0 {
+            continue;
+        }
+        filled
+            .replace(name, Series::new(name.as_str().into(), after))
+            .map_err(|e| format!("replace column {}: {}", name, e))?;
+        if let Some(c) = report.per_column.get_mut(name) {
+            c.n_filled = c.n_filled.saturating_sub(reverted);
+            c.n_gaps_after += reverted;
+        }
+        report.total_filled = report.total_filled.saturating_sub(reverted);
+        report.total_gaps_after += reverted;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn gap_filling_run_classical(
     state: State<'_, AppState>,
     dataset: String,
     columns: Vec<String>,
     method: serde_json::Value,
+    // Same gap-size window as the SAITS path (`cleaning_complete_saits`): in
+    // minutes, both optional. A linear interpolation is sound across a few
+    // hours and turns into a straight line across a week — the user decides
+    // where that line is.
+    min_gap_minutes: Option<f64>,
+    max_gap_minutes: Option<f64>,
 ) -> Result<serde_json::Value, String> {
     let method: GapFillMethod = serde_json::from_value(method)
         .map_err(|e| format!("méthode de gap-filling invalide: {}", e))?;
+    let to_ms = |m: f64| -> i64 { (m * 60_000.0).round() as i64 };
+    let min_ms = min_gap_minutes.filter(|m| *m > 0.0).map(to_ms);
+    let max_ms = max_gap_minutes.filter(|m| *m > 0.0).map(to_ms);
+    if let (Some(a), Some(b)) = (min_ms, max_ms) {
+        if a > b {
+            return Err("La taille minimale de trou dépasse la taille maximale.".to_string());
+        }
+    }
 
     // Pull the latest version of the source dataset. If a previous step
     // cleaned the SAME dataset, pull that version (so successive fills stack).
@@ -847,12 +1151,16 @@ pub async fn gap_filling_run_classical(
     };
 
     let (filled_df, report): (DataFrame, GapFillReport) =
-        tokio::task::spawn_blocking(move || {
-            data_cleaning::fill_gaps_classical(&df, &columns, method)
+        tokio::task::spawn_blocking(move || -> Result<(DataFrame, GapFillReport), String> {
+            let (mut filled, mut report) =
+                data_cleaning::fill_gaps_classical(&df, &columns, method).map_err(|e| e.to_string())?;
+            if min_ms.is_some() || max_ms.is_some() {
+                revert_out_of_range_fills(&df, &mut filled, &mut report, &columns, min_ms, max_ms)?;
+            }
+            Ok((filled, report))
         })
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())??;
 
     let filled_columns: Vec<String> = report.per_column.keys().cloned().collect();
     {
@@ -1217,7 +1525,7 @@ pub async fn cleaning_apply_ml(
 /// raw_data on the next read. Lets the user undo a botched cleaning without
 /// re-importing the file.
 #[tauri::command]
-pub fn cleaning_reset_to_raw(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn cleaning_reset_to_raw(state: State<'_, AppState>) -> Result<(), String> {
     let mut app = state.inner.lock().map_err(|e| e.to_string())?;
     let had = app.cleaned_data.is_some();
     app.cleaned_data = None;
@@ -1226,6 +1534,7 @@ pub fn cleaning_reset_to_raw(state: State<'_, AppState>) -> Result<(), String> {
     app.cleaning_path = None;
     app.cleaning_target_columns.clear();
     app.cleaning_locked_stages.clear();
+    app.imported_stages.clear();
     app.cleaning_pre_snapshots.clear();
     logger::add_log(
         &mut app.logs,
@@ -1241,7 +1550,7 @@ pub fn cleaning_reset_to_raw(state: State<'_, AppState>) -> Result<(), String> {
 /// by the "Réinitialiser tout" UI control when the user wants to start
 /// fresh after the auto-restore has rehydrated stale data.
 #[tauri::command]
-pub fn clear_session(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn clear_session(state: State<'_, AppState>) -> Result<(), String> {
     {
         let mut app = state.inner.lock().map_err(|e| e.to_string())?;
         *app = crate::state::AppData::default();
@@ -1287,7 +1596,7 @@ pub async fn get_cleaning_pre_rows(
 }
 
 #[tauri::command]
-pub fn get_cleaning_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn get_cleaning_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let app = state.inner.lock().map_err(|e| e.to_string())?;
     let src = app.cleaning_source_dataset.as_deref();
     // Pipeline can only be re-run from raw — cleaning a derived slot doesn't
@@ -1326,7 +1635,7 @@ const LOCKABLE_STAGES: [&str; 9] =
 /// Lock a cleaned derived stage so a full recompute can't silently wipe it.
 /// Idempotent; returns the full locked-stage list.
 #[tauri::command]
-pub fn cleaning_lock_permanent(
+pub async fn cleaning_lock_permanent(
     state: State<'_, AppState>,
     dataset: String,
 ) -> Result<serde_json::Value, String> {
@@ -1351,7 +1660,7 @@ pub fn cleaning_lock_permanent(
 
 /// Remove a lock previously set by `cleaning_lock_permanent`. Idempotent.
 #[tauri::command]
-pub fn cleaning_unlock_permanent(
+pub async fn cleaning_unlock_permanent(
     state: State<'_, AppState>,
     dataset: String,
 ) -> Result<serde_json::Value, String> {
@@ -1370,7 +1679,7 @@ pub fn cleaning_unlock_permanent(
 }
 
 #[tauri::command]
-pub fn cleaning_reset_ml(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn cleaning_reset_ml(state: State<'_, AppState>) -> Result<(), String> {
     let mut app = state.inner.lock().map_err(|e| e.to_string())?;
     if app.ml_cleaner.take().is_some() {
         logger::add_log(
@@ -1387,7 +1696,7 @@ pub fn cleaning_reset_ml(state: State<'_, AppState>) -> Result<(), String> {
 // =============================================================================
 
 #[tauri::command]
-pub fn cleaning_ml_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn cleaning_ml_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let app = state.inner.lock().map_err(|e| e.to_string())?;
     if let Some(cleaner) = app.ml_cleaner.as_ref() {
         let metrics = cleaner.metrics().cloned();
@@ -1412,7 +1721,7 @@ pub fn cleaning_ml_status(state: State<'_, AppState>) -> Result<serde_json::Valu
 /// at app startup to know what's already loaded and skip the empty-state
 /// flow when the underlying Rust process survived a webview reload.
 #[tauri::command]
-pub fn get_app_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn get_app_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let app = state.inner.lock().map_err(|e| e.to_string())?;
 
     // Raw data presence — drives `dataLoaded` and the "you have a file
@@ -1458,4 +1767,156 @@ pub fn get_app_status(state: State<'_, AppState>) -> Result<serde_json::Value, S
         // on boot rather than re-prompting for files.
         "session_restored": raw.is_some(),
     }))
+}
+
+#[cfg(test)]
+mod reindex_tests {
+    use super::*;
+    use polars::prelude::*;
+
+    // Real frames carry TIMESTAMP as Datetime(Microseconds) — and
+    // `ts_col_to_datetimes` reads the physical value as microseconds whatever
+    // unit the column declares — so the tests use that unit too.
+    const US_PER_MIN: i64 = 60_000_000;
+    const BASE_US: i64 = 1_704_067_200_000_000; // 2024-01-01T00:00:00Z
+
+    fn frame(minutes: &[i64], vals: Vec<f64>) -> DataFrame {
+        let ts: Vec<i64> = minutes.iter().map(|m| BASE_US + m * US_PER_MIN).collect();
+        let ts_s = Series::new("TIMESTAMP".into(), ts)
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
+            .unwrap();
+        DataFrame::new(vec![ts_s, Series::new("v".into(), vals)]).unwrap()
+    }
+
+    /// Half-hourly, with 90/120/150 min absent between 60 and 180.
+    fn holed() -> DataFrame {
+        frame(&[0, 30, 60, 180, 210], vec![1.0, 2.0, 3.0, 4.0, 5.0])
+    }
+
+    #[test]
+    fn inserts_exactly_the_missing_instants() {
+        let (out, inserted, step, before, after) = reindex_on_grid(&holed(), "t600", None).unwrap();
+        assert_eq!(step, 1800, "half-hourly cadence");
+        assert_eq!(inserted, 3, "90, 120 and 150 min are missing");
+        assert_eq!((before, after), (5, 8));
+        assert_eq!(out.height(), 8);
+    }
+
+    #[test]
+    fn existing_values_keep_their_instant_and_inserted_rows_are_null() {
+        let (out, _, _, _, _) = reindex_on_grid(&holed(), "t600", None).unwrap();
+        let got: Vec<Option<f64>> = out.column("v").unwrap().f64().unwrap().into_iter().collect();
+        assert_eq!(
+            got,
+            vec![Some(1.0), Some(2.0), Some(3.0), None, None, None, Some(4.0), Some(5.0)],
+            "the three spliced rows carry no value, the real ones are untouched"
+        );
+    }
+
+    #[test]
+    fn timestamps_come_back_in_order_and_on_the_grid() {
+        let (out, _, _, _, _) = reindex_on_grid(&holed(), "t600", None).unwrap();
+        let ms = row_millis(&out).unwrap();
+        let minutes: Vec<i64> = ms.iter().map(|t| (t - BASE_US / 1000) / 60_000).collect();
+        assert_eq!(minutes, vec![0, 30, 60, 90, 120, 150, 180, 210]);
+    }
+
+    #[test]
+    fn a_series_without_holes_is_returned_untouched() {
+        let df = frame(&[0, 30, 60, 90, 120, 150], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let (out, inserted, _, before, after) = reindex_on_grid(&df, "t600", None).unwrap();
+        assert_eq!(inserted, 0);
+        assert_eq!(before, after);
+        assert_eq!(out.height(), 6);
+    }
+
+    #[test]
+    fn a_step_override_is_honoured() {
+        // Force an hourly grid: only 120 min is then missing between 60 and 180.
+        let (_, inserted, step, _, _) = reindex_on_grid(&holed(), "t600", Some(3600)).unwrap();
+        assert_eq!(step, 3600);
+        assert_eq!(inserted, 1);
+    }
+
+    #[test]
+    fn too_short_a_series_is_refused_rather_than_guessed() {
+        let df = frame(&[0, 30], vec![1.0, 2.0]);
+        assert!(reindex_on_grid(&df, "t600", None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod origin_flag_tests {
+    use super::*;
+    use polars::prelude::*;
+
+    const US_PER_MIN: i64 = 60_000_000;
+    const BASE_US: i64 = 1_704_067_200_000_000; // 2024-01-01T00:00:00Z
+
+    fn frame(minutes: &[i64], vals: Vec<Option<f64>>) -> DataFrame {
+        let ts: Vec<i64> = minutes.iter().map(|m| BASE_US + m * US_PER_MIN).collect();
+        let ts_s = Series::new("TIMESTAMP".into(), ts)
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
+            .unwrap();
+        DataFrame::new(vec![ts_s, Series::new("Fd_1".into(), vals)]).unwrap()
+    }
+
+    fn flags_of(working: &DataFrame, pristine: &DataFrame) -> Vec<u32> {
+        let f = origin_flag_frame(working, pristine, &["Fd_1".to_string()]).unwrap();
+        f.column("Fd_1_flag").unwrap().u32().unwrap().into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn an_untouched_series_is_all_measured_and_holes_are_not_filled() {
+        let df = frame(&[0, 30, 60], vec![Some(1.0), None, Some(3.0)]);
+        // No cleaning ever happened: the frame is its own pristine version.
+        assert_eq!(flags_of(&df, &df), vec![0, 4, 0]);
+    }
+
+    #[test]
+    fn a_value_changed_since_the_snapshot_reads_as_cleaned_then_filled() {
+        let pristine = frame(&[0, 30, 60], vec![Some(1.0), Some(99.0), Some(3.0)]);
+        let working = frame(&[0, 30, 60], vec![Some(1.0), Some(2.1), Some(3.0)]);
+        assert_eq!(flags_of(&working, &pristine), vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn a_value_removed_and_left_empty_reads_as_not_filled() {
+        let pristine = frame(&[0, 30, 60], vec![Some(1.0), Some(99.0), Some(3.0)]);
+        let working = frame(&[0, 30, 60], vec![Some(1.0), None, Some(3.0)]);
+        assert_eq!(flags_of(&working, &pristine), vec![0, 4, 0]);
+    }
+
+    #[test]
+    fn a_hole_of_the_original_file_that_got_filled_reads_as_absent_then_filled() {
+        let pristine = frame(&[0, 30, 60], vec![Some(1.0), None, Some(3.0)]);
+        let working = frame(&[0, 30, 60], vec![Some(1.0), Some(2.0), Some(3.0)]);
+        assert_eq!(flags_of(&working, &pristine), vec![0, 2, 0]);
+    }
+
+    #[test]
+    fn a_row_spliced_into_the_grid_reads_2_when_filled_and_4_when_not() {
+        let pristine = frame(&[0, 60], vec![Some(1.0), Some(3.0)]);
+        // 30 min did not exist at acquisition; it was reindexed in, then filled.
+        let filled = frame(&[0, 30, 60], vec![Some(1.0), Some(2.0), Some(3.0)]);
+        assert_eq!(flags_of(&filled, &pristine), vec![0, 2, 0]);
+        let empty = frame(&[0, 30, 60], vec![Some(1.0), None, Some(3.0)]);
+        assert_eq!(flags_of(&empty, &pristine), vec![0, 4, 0]);
+    }
+
+    #[test]
+    fn a_column_absent_from_the_snapshot_is_treated_as_never_measured() {
+        // Snapshot taken before this sensor existed: every value it now holds
+        // comes from somewhere other than the original acquisition.
+        let pristine = frame(&[0, 30], vec![Some(1.0), Some(2.0)]);
+        let working = frame(&[0, 30], vec![Some(1.0), Some(2.0)]);
+        let f = origin_flag_frame(&working, &pristine, &["Fd_absent".to_string()]).unwrap();
+        assert_eq!(f.width(), 1, "an unknown column contributes no flag column");
+    }
+
+    #[test]
+    fn non_finite_values_count_as_holes_not_as_measurements() {
+        let df = frame(&[0, 30], vec![Some(1.0), Some(f64::NAN)]);
+        assert_eq!(flags_of(&df, &df), vec![0, 4]);
+    }
 }

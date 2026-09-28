@@ -588,6 +588,8 @@
   "detection.simple.target.helper": "Tick the columns you want the model to learn to predict — these are also the columns that will be cleaned in the Gap Filling tab.",
   "detection.simple.target.title": "What to clean?",
   "detection.simplePreview.clear": "Clear zones",
+  "detection.simplePreview.selectAll": "Select all",
+  "detection.simplePreview.selectAllHint": "Covers the whole period as one zone — you can then reshape it by dragging.",
   "detection.simplePreview.empty": "Check at least one column to see the preview",
   "detection.simplePreview.helper": "One chart per checked column (each has its own Y scale, so differing amplitudes stay readable). Click-drag on the chart to paint a training zone — add as many as you need to exclude bad periods (peaks, sensor faults, irrigation). The model will learn on the union of the violet bands.",
   "detection.simplePreview.hiddenCols": "(+{count} column(s) hidden for readability)",

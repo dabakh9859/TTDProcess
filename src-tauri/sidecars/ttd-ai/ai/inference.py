@@ -217,20 +217,26 @@ def run_predict(params: dict[str, Any], _emit: Callable[[str, dict], None]) -> d
     else:
         pred = stitched[:, tgt_idx] * entry.sig[tgt_idx] + entry.mu[tgt_idx]
 
-    # Guard against aberrant fills: bound the reconstruction to a robust band of
-    # the target's OWN observed values (median ± K·MAD). On near-constant
-    # channels with rare dropout artifacts (e.g. T600) this clips the occasional
-    # dropout-magnitude fill back to the plausible range; on high-variance
-    # signals the MAD band is wide, so legitimate dynamics pass untouched.
+    # Guard against aberrant fills: bound the reconstruction to the range the
+    # target has ACTUALLY been observed in, taken between the 0.5th and 99.5th
+    # percentiles so a handful of dropout artifacts cannot stretch it, then
+    # widened by 5 % of that span so a fill may slightly exceed the largest
+    # value ever measured.
+    #
+    # This used to be a median ± 10·MAD band, which is fine on a near-constant
+    # channel such as T600 but capped sap flow: with nights and the dry season
+    # the median sits near zero and the MAD is tiny, so the band topped out
+    # around 2 l dm⁻² h⁻¹ while real daytime peaks reach 4-5. Every long gap came
+    # back with a flat-topped envelope at that ceiling.
     obs_col = target_col if proxy_col is not None else target_col
     obs = (df_raw[obs_col] if proxy_col is not None else df[target_col]).reindex(df.index).to_numpy(dtype=float)
     obs = obs[np.isfinite(obs)]
     if obs.size >= 20:
-        med = float(np.median(obs))
-        mad = float(np.median(np.abs(obs - med))) * 1.4826
-        if mad > 0:
-            k = 10.0
-            pred = np.clip(pred, med - k * mad, med + k * mad)
+        lo, hi = (float(v) for v in np.percentile(obs, [0.5, 99.5]))
+        span = hi - lo
+        if span > 0:
+            margin = 0.05 * span
+            pred = np.clip(pred, lo - margin, hi + margin)
 
     pred_series = pd.Series(pred, index=df.index, name=target_col)
     gap_series = pred_series.loc[gap_start:gap_end]

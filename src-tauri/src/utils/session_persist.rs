@@ -84,6 +84,12 @@ pub struct SessionMeta {
     /// so a lock survives a Windows-sleep restart or a cargo rebuild.
     #[serde(default)]
     pub cleaning_locked_stages: Vec<String>,
+    /// Stages loaded straight from a file (see AppData). Persisted so a
+    /// restart doesn't silently go back to rebuilding them from raw.
+    #[serde(default)]
+    pub imported_stages: Vec<String>,
+    #[serde(default)]
+    pub last_import_target: Option<String>,
     pub sap_flow_params: SapFlowParams,
     pub ttdplus_params: TtdPlusParams,
     pub config: ProjectConfig,
@@ -209,6 +215,8 @@ pub fn save(data: &AppData) {
         cleaning_path: data.cleaning_path.clone(),
         cleaning_target_columns: data.cleaning_target_columns.clone(),
         cleaning_locked_stages: data.cleaning_locked_stages.clone(),
+        imported_stages: data.imported_stages.clone(),
+        last_import_target: data.last_import_target.clone(),
         sap_flow_params: data.sap_flow_params.clone(),
         ttdplus_params: data.ttdplus_params.clone(),
         config: data.config.clone(),
@@ -313,6 +321,8 @@ pub fn load() -> AppData {
                     data.cleaning_path = m.cleaning_path;
                     data.cleaning_target_columns = m.cleaning_target_columns;
                     data.cleaning_locked_stages = m.cleaning_locked_stages;
+                    data.imported_stages = m.imported_stages;
+                    data.last_import_target = m.last_import_target;
                     data.sap_flow_params = m.sap_flow_params;
                     data.ttdplus_params = m.ttdplus_params;
                     data.config = m.config;

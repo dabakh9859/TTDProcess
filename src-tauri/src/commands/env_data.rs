@@ -289,7 +289,7 @@ pub async fn load_env_data(
 }
 
 #[tauri::command]
-pub fn get_env_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn get_env_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let data = state.inner.lock().map_err(|e| e.to_string())?;
 
     let Some(df) = data.env_data.as_ref() else {
@@ -309,7 +309,7 @@ pub fn get_env_info(state: State<'_, AppState>) -> Result<serde_json::Value, Str
 }
 
 #[tauri::command]
-pub fn clear_env_data(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn clear_env_data(state: State<'_, AppState>) -> Result<(), String> {
     let mut data = state.inner.lock().map_err(|e| e.to_string())?;
     data.env_data = None;
     data.env_file_path = None;

@@ -119,6 +119,18 @@ pub async fn load_data(
                 "sap_flow" => data.results.sap_flow = Some(df.clone()),
                 other => return Err(format!("Destination inconnue : '{}'", other)),
             }
+            // Remember that this stage came from a file. `run_pipeline` reads
+            // this to resume from here instead of rebuilding the stage from
+            // raw data that belongs to a different (older) import.
+            if target_key != "cleaned" && !data.imported_stages.iter().any(|s| *s == target_key) {
+                data.imported_stages.push(target_key.clone());
+            }
+            data.last_import_target = Some(target_key.clone());
+            // A file loaded AS this stage replaces its contents wholesale, so a
+            // pre-cleaning snapshot taken on the previous contents — possibly
+            // another station's — no longer describes anything. Keeping it
+            // would make the origin flags read every value as reconstructed.
+            data.cleaning_pre_snapshots.remove(&target_key);
             // Several downstream commands bail with "Aucune donnée chargée" when
             // raw_data is empty, even when they never read it (recompute_from_
             // stage only uses it for the steps BEFORE the one it restarts from).
@@ -161,6 +173,9 @@ pub async fn load_data(
         data.cleaning_target_columns.clear();
         data.cleaning_locked_stages.clear();
         data.cleaning_pre_snapshots.clear();
+        // Stages imported against the PREVIOUS file no longer describe anything.
+        data.imported_stages.clear();
+        data.last_import_target = None;
 
         logger::add_log(
             &mut data.logs,
@@ -205,11 +220,30 @@ pub async fn load_data(
 
 #[tauri::command]
 pub async fn get_column_stats(state: State<'_, AppState>) -> Result<Vec<ColumnStats>, String> {
-    // Clone the DataFrame out of the lock so we can process on a background thread
+    // The import page calls this with no argument — once on mount and once
+    // right after a load — so it has to resolve the dataset itself. It must be
+    // the file the user actually just imported: after a load AS a stage,
+    // `raw_data` still holds the previous, unrelated import, and reporting on
+    // that made the page show logger columns (RECORD, U_Bat, …) for a T600
+    // file, as if the import had silently loaded the old data.
     let df = {
         let data = state.inner.lock().map_err(|e| e.to_string())?;
-        data.raw_data
-            .as_ref()
+        let staged = data.last_import_target.as_deref().and_then(|key| match key {
+            "cleaned" => data.cleaned_data.as_ref(),
+            "tslope" => data.results.tslope.as_ref(),
+            "baseline" => data.results.baseline.as_ref(),
+            "delta_t" => data.results.delta_t.as_ref(),
+            "t600" => data.results.t600.as_ref(),
+            "tm" => data.results.tm.as_ref(),
+            "stm" => data.results.stm.as_ref(),
+            "tmi" => data.results.tmi.as_ref(),
+            "k" => data.results.k.as_ref(),
+            "sap_flow" => data.results.sap_flow.as_ref(),
+            _ => None,
+        });
+        // Fall back to raw when the slot was emptied since (reset, forced run).
+        staged
+            .or(data.raw_data.as_ref())
             .ok_or_else(|| "No data loaded".to_string())?
             .clone()
     };

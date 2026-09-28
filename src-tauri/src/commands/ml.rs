@@ -142,7 +142,7 @@ pub async fn train_model(
 // =============================================================================
 
 #[tauri::command]
-pub fn predict(
+pub async fn predict(
     state: State<'_, AppState>,
     model_id: String,
     start_idx: usize,
@@ -177,7 +177,7 @@ pub fn predict(
 // =============================================================================
 
 #[tauri::command]
-pub fn list_models(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn list_models(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let data = state.inner.lock().map_err(|e| e.to_string())?;
 
     let models: Vec<serde_json::Value> = data
@@ -203,12 +203,33 @@ pub fn list_models(state: State<'_, AppState>) -> Result<serde_json::Value, Stri
     Ok(serde_json::json!({ "models": models }))
 }
 
+/// Drop a trained classical model from the session — both its metadata and its
+/// cached fitted state. The SAITS models live in the Python sidecar instead and
+/// are removed by `ai_model_delete`.
+#[tauri::command]
+pub async fn delete_model(
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<serde_json::Value, String> {
+    let mut data = state.inner.lock().map_err(|e| e.to_string())?;
+    let removed = data.trained_models.remove(&model_id).is_some();
+    data.model_cache.remove(&model_id);
+    if removed {
+        crate::utils::logger::add_log(
+            &mut data.logs,
+            crate::core::types::LogLevel::Info,
+            format!("Modèle supprimé de la session : {}", model_id),
+        );
+    }
+    Ok(serde_json::json!({ "model_id": model_id, "removed": removed }))
+}
+
 // =============================================================================
 // save_model / load_model (future work — minimal stub)
 // =============================================================================
 
 #[tauri::command]
-pub fn save_model(
+pub async fn save_model(
     state: State<'_, AppState>,
     model_id: String,
     path: String,
@@ -233,7 +254,7 @@ pub fn save_model(
 }
 
 #[tauri::command]
-pub fn load_model(
+pub async fn load_model(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<String, String> {

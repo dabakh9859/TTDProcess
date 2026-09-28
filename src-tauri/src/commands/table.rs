@@ -585,7 +585,7 @@ fn parse_optional_string(value: &serde_json::Value) -> Option<String> {
 /// names so the viz page can populate cascading source → column dropdowns
 /// without making 15 separate `get_table_page` calls just to get headers.
 #[tauri::command]
-pub fn viz_list_sources(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn viz_list_sources(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let data = state.inner.lock().map_err(|e| e.to_string())?;
     let mk = |key: &str, df: &Option<DataFrame>| -> Option<serde_json::Value> {
         df.as_ref().map(|d| {
@@ -651,7 +651,7 @@ pub fn viz_list_sources(state: State<'_, AppState>) -> Result<serde_json::Value,
     // agg becomes a source with key "agg_<id>"; columns = period + columns,
     // n_rows = n_periods. The name + dataset go in the friendly_label /
     // origin fields so the frontend can render a human label.
-    if let Ok(aggs) = crate::commands::aggregation::list_aggregations() {
+    if let Ok(aggs) = crate::commands::aggregation::list_aggregations_inner() {
         for m in aggs {
             let mut cols: Vec<String> = vec!["period".to_string()];
             cols.extend(m.columns.iter().cloned());
@@ -761,7 +761,7 @@ pub async fn viz_load_file(
 
 /// Drop a file previously opened with `viz_load_file`.
 #[tauri::command]
-pub fn viz_unload_file(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn viz_unload_file(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let mut data = state.inner.lock().map_err(|e| e.to_string())?;
     // Accept either the bare id or the "file:<id>" source key.
     let key = id.strip_prefix("file:").unwrap_or(&id).to_string();
@@ -776,7 +776,7 @@ pub fn viz_unload_file(state: State<'_, AppState>, id: String) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn get_datasets_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn get_datasets_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let data = state.inner.lock().map_err(|e| e.to_string())?;
 
     let dataset_info = |name: &str, df: &Option<DataFrame>| -> serde_json::Value {

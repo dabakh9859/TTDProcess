@@ -325,7 +325,7 @@ pub async fn fill_gaps(
 }
 
 #[tauri::command]
-pub fn validate_detection(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn validate_detection(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let mut app = state.inner.lock().map_err(|e| e.to_string())?;
 
     let detection = app

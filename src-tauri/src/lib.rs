@@ -45,6 +45,7 @@ pub fn run() {
             commands::ml::train_model,
             commands::ml::predict,
             commands::ml::list_models,
+            commands::ml::delete_model,
             commands::ml::save_model,
             commands::ml::load_model,
             // Cleaning commands
@@ -77,6 +78,8 @@ pub fn run() {
             commands::cleaning_v2::cleaning_mark_manual_nan,
             commands::cleaning_v2::cleaning_time_gaps,
             commands::cleaning_v2::cleaning_reindex_time,
+            commands::cleaning_v2::cleaning_origin_flags,
+            commands::cleaning_v2::export_origin_flags,
             commands::cleaning_v2::cleaning_reset_ml,
             commands::cleaning_v2::cleaning_reset_to_raw,
             commands::cleaning_v2::cleaning_lock_permanent,
@@ -99,6 +102,7 @@ pub fn run() {
             // Export
             commands::export::export_data,
             commands::export::export_data_multi,
+            commands::export::export_data_multi_files,
             commands::export::export_aggregation,
             // Journal
             commands::journal::get_logs,
@@ -109,6 +113,7 @@ pub fn run() {
             commands::ai::ai_predict,
             commands::ai::ai_model_save,
             commands::ai::ai_model_load,
+            commands::ai::ai_model_delete,
             commands::ai::ai_inspect_files,
             commands::ai::ai_list_models,
             commands::ai::ai_list_env_columns,

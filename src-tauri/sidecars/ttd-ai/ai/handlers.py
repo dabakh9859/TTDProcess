@@ -103,6 +103,18 @@ def list_env_columns(params: dict[str, Any], _emit: Callable[[str, dict], None])
     }
 
 
+def model_delete(params: dict[str, Any], _emit: Callable[[str, dict], None]) -> dict[str, Any]:
+    """Drop a model from the in-process registry.
+
+    Only frees the sidecar's memory — a `.ttdmodel` already exported to disk is
+    untouched, and can be re-imported later.
+    """
+    from . import registry
+    model_id = params["model_id"]
+    removed = registry.remove(model_id)
+    return {"model_id": model_id, "removed": removed, "remaining": registry.list_ids()}
+
+
 def list_models(_params: dict[str, Any], _emit: Callable[[str, dict], None]) -> dict[str, Any]:
     """Return all models currently in the in-process registry."""
     from . import registry

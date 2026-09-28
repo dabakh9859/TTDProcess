@@ -89,7 +89,7 @@ fn try_read(path: &Path) -> Option<DataFrame> {
 /// here (delete-an-aggregation stays the source of truth).
 #[allow(dead_code)]
 fn list_aggregation_ids_safely() -> Vec<String> {
-    crate::commands::aggregation::list_aggregations()
+    crate::commands::aggregation::list_aggregations_inner()
         .map(|v| v.into_iter().map(|m| m.id).collect())
         .unwrap_or_default()
 }
@@ -159,7 +159,7 @@ fn compute_summary(app: &crate::state::AppData) -> ResultsSummary {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn save_scenario(
+pub async fn save_scenario(
     state: State<'_, AppState>,
     name: String,
     description: String,
@@ -233,7 +233,7 @@ pub fn save_scenario(
     // Bundle every saved aggregation INTO the scenario directory so the
     // scenario is self-contained. Even if the user deletes an aggregation
     // later, reloading the scenario re-creates it.
-    let agg_metas = crate::commands::aggregation::list_aggregations().unwrap_or_default();
+    let agg_metas = crate::commands::aggregation::list_aggregations_inner().unwrap_or_default();
     let agg_target = dir.join("aggregations");
     let _ = fs::create_dir_all(&agg_target);
     let mut bundled_agg_ids: Vec<String> = Vec::with_capacity(agg_metas.len());
@@ -312,7 +312,7 @@ pub fn save_scenario(
 }
 
 #[tauri::command]
-pub fn load_scenario(
+pub async fn load_scenario(
     state: State<'_, AppState>,
     scenario_id: String,
 ) -> Result<serde_json::Value, String> {
@@ -461,7 +461,7 @@ pub fn load_scenario(
 }
 
 #[tauri::command]
-pub fn list_scenarios(_state: State<'_, AppState>) -> Result<Vec<Scenario>, String> {
+pub async fn list_scenarios(_state: State<'_, AppState>) -> Result<Vec<Scenario>, String> {
     let root = scenarios_root();
     let mut scenarios = Vec::new();
     if !root.exists() {
@@ -496,7 +496,7 @@ pub fn list_scenarios(_state: State<'_, AppState>) -> Result<Vec<Scenario>, Stri
 }
 
 #[tauri::command]
-pub fn delete_scenario(
+pub async fn delete_scenario(
     state: State<'_, AppState>,
     scenario_id: String,
 ) -> Result<String, String> {
@@ -520,7 +520,7 @@ pub fn delete_scenario(
 }
 
 #[tauri::command]
-pub fn list_scenario_datasets(scenario_id: String) -> Result<Vec<serde_json::Value>, String> {
+pub async fn list_scenario_datasets(scenario_id: String) -> Result<Vec<serde_json::Value>, String> {
     let dir = scenario_dir(&scenario_id);
     if !dir.exists() {
         return Err(format!("Scénario introuvable : {}", scenario_id));
@@ -588,7 +588,7 @@ fn summarize_overlay(o: &crate::core::types::ScenarioOverlay) -> ScenarioOverlay
 /// Visualisation tab can list them as extra sources. Does NOT touch the
 /// live raw/cleaned/results state — overlays sit alongside, never replace.
 #[tauri::command]
-pub fn viz_overlay_load(
+pub async fn viz_overlay_load(
     state: State<'_, AppState>,
     scenario_id: String,
 ) -> Result<ScenarioOverlaySummary, String> {
@@ -639,7 +639,7 @@ pub fn viz_overlay_load(
 }
 
 #[tauri::command]
-pub fn viz_overlay_remove(
+pub async fn viz_overlay_remove(
     state: State<'_, AppState>,
     scenario_id: String,
 ) -> Result<(), String> {
@@ -657,7 +657,7 @@ pub fn viz_overlay_remove(
 /// Lists every overlay currently loaded. Sorted by scenario name for a
 /// stable UI order.
 #[tauri::command]
-pub fn viz_overlay_list(
+pub async fn viz_overlay_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<ScenarioOverlaySummary>, String> {
     let app = state.inner.lock().map_err(|e| e.to_string())?;

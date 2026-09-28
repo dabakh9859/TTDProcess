@@ -4,6 +4,7 @@
   "version": "2.6.0",
   "type": "module",
   "scripts": {
+    "ui:apply": "node scripts/apply-interface.mjs",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",

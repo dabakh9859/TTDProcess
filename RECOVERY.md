@@ -1,5 +1,16 @@
 # TTDProcess v2.5.0 — notes de récupération
 
+> **Mise à jour du 28/09/2026** — ce document décrit l'état au 16/08. Depuis :
+>
+> - `src-tauri/Cargo.lock` existe à nouveau (régénéré au premier `cargo build`
+>   du 12/09) : la section « Perdu » ne s'applique plus à lui.
+> - Le backend expose 93 commandes, et non plus 88 (voir FRONTEND-MAP.md).
+> - `dist/assets/index-0nLOWM5B.js` a été **patché à la main** (22/09) et diffère
+>   désormais de `recovered/dist-original/`. `./linux.sh originale` restaure
+>   l'ancienne version et **efface ces patchs** : ne l'utiliser qu'en connaissance
+>   de cause.
+> - Le projet est sous git (dépôt `github.com/dabakh9859/TTDProcess`).
+
 Récupération du 16/08/2026. Le projet avait été réduit à `src-tauri/` seul (config,
 frontend et fichiers racine perdus). Ce document décrit ce qui a été restauré, comment,
 et ce qui reste incertain.

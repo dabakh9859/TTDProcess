@@ -51,7 +51,7 @@ fn resolve_dataset(
 /// List every dataset key that currently holds a DataFrame, with row/col
 /// counts. Used by the frontend to populate the source dropdown.
 #[tauri::command]
-pub fn list_aggregation_sources(
+pub async fn list_aggregation_sources(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let app = state.inner.lock().map_err(|e| e.to_string())?;
@@ -100,6 +100,17 @@ pub async fn aggregate_data(
     custom_seconds: Option<i64>,
     profile: Option<String>,
     profile_by: Option<String>,
+    // Minimum number of non-missing steps a bucket must hold to be reported.
+    // A daily sum over 6 valid half-hours is not a daily total, it is a
+    // fragment that lands on the same axis as complete days and drags every
+    // statistic down — convention C4 of the processing report calls a day
+    // valid only at 48/48. `None` keeps the historical behaviour (report
+    // whatever is there).
+    min_count: Option<usize>,
+    // Multiply every aggregated value. Carries the unit conversion the report
+    // needs: summing 48 half-hourly values of l dm⁻² h⁻¹ gives l dm⁻² j⁻¹ only
+    // after ×0.5, and doing it by hand on every export invites mistakes.
+    scale: Option<f64>,
 ) -> Result<serde_json::Value, String> {
     // Resolve dataset under a short lock then release.
     let (df, dataset_key) = {
@@ -129,6 +140,7 @@ pub async fn aggregate_data(
             &df, &columns_clone, &period_clone, &operation_clone,
             custom_days, custom_seconds, &dataset_key_for_inner, cross_sensor,
             profile_clone.as_deref(), profile_by_clone.as_deref(),
+            min_count.unwrap_or(0), scale.unwrap_or(1.0),
         )
     })
     .await
@@ -200,6 +212,8 @@ fn aggregate_inner(
     cross_sensor: bool,
     profile: Option<&str>,
     profile_by: Option<&str>,
+    min_count: usize,
+    scale: f64,
 ) -> Result<serde_json::Value, String> {
     // Find the timestamp column. Qd uses DATE (Polars Date) — every other
     // dataset uses TIMESTAMP (datetime). Both branches end up as strings of
@@ -246,7 +260,7 @@ fn aggregate_inner(
     // one column (curve) per outer group (week/month/…). Returns early so the
     // Visualisation tab can overlay the curves on a synthetic time-of-day axis.
     if profile.is_some() {
-        return aggregate_profile(&ts_vec, &col_data, columns, operation, profile_by, cross_sensor);
+        return aggregate_profile(&ts_vec, &col_data, columns, operation, profile_by, cross_sensor, min_count, scale);
     }
 
     let group_keys: Vec<String> = ts_vec.iter().map(|&s| {
@@ -287,7 +301,9 @@ fn aggregate_inner(
                     })
                     .collect();
 
-                let agg = if vals.is_empty() {
+                // Below the required count the bucket is incomplete: report
+                // nothing rather than a partial total that would pass for one.
+                let agg = if vals.is_empty() || vals.len() < min_count {
                     serde_json::Value::Null
                 } else {
                     let v = match operation {
@@ -295,7 +311,7 @@ fn aggregate_inner(
                         "Minimum" => vals.iter().cloned().fold(f64::INFINITY, f64::min),
                         "Maximum" => vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                         _ => vals.iter().sum::<f64>() / vals.len() as f64, // Moyenne
-                    };
+                    } * scale;
                     serde_json::json!((v * 10000.0).round() / 10000.0)
                 };
                 row[col_name.as_str()] = agg;
@@ -373,6 +389,8 @@ fn aggregate_profile(
     operation: &str,
     profile_by: Option<&str>,
     cross_sensor: bool,
+    min_count: usize,
+    scale: f64,
 ) -> Result<serde_json::Value, String> {
     let by = profile_by.unwrap_or("Global");
 
@@ -402,7 +420,21 @@ fn aggregate_profile(
         }
     }
 
-    let agg = |vals: &[f64]| -> f64 {
+    // Same two rules as the period path: a bucket thinner than `min_count`
+    // reports nothing, and `scale` carries the unit conversion.
+    let agg = |vals: &[f64]| -> Option<f64> {
+        if vals.is_empty() || vals.len() < min_count {
+            return None;
+        }
+        let v = match operation {
+            "Somme" => vals.iter().sum::<f64>(),
+            "Minimum" => vals.iter().cloned().fold(f64::INFINITY, f64::min),
+            "Maximum" => vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            _ => vals.iter().sum::<f64>() / vals.len() as f64,
+        };
+        Some(v * scale)
+    };
+    let reduce = |vals: &[f64]| -> f64 {
         match operation {
             "Somme" => vals.iter().sum::<f64>(),
             "Minimum" => vals.iter().cloned().fold(f64::INFINITY, f64::min),
@@ -433,15 +465,15 @@ fn aggregate_profile(
             if cross_sensor {
                 let cell = per_sensor.and_then(|ps| {
                     let sensor_vals: Vec<f64> = columns.iter()
-                        .filter_map(|s| ps.get(s).filter(|v| !v.is_empty()).map(|v| agg(v)))
+                        .filter_map(|s| ps.get(s).and_then(|v| agg(v)))
                         .collect();
-                    if sensor_vals.is_empty() { None } else { Some(round(agg(&sensor_vals))) }
+                    if sensor_vals.is_empty() { None } else { Some(round(reduce(&sensor_vals))) }
                 });
                 row[g.as_str()] = match cell { Some(x) => serde_json::json!(x), None => serde_json::Value::Null };
             } else {
                 for s in columns {
                     let name = format!("{} · {}", g, s);
-                    let cell = per_sensor.and_then(|ps| ps.get(s)).filter(|v| !v.is_empty()).map(|v| round(agg(v)));
+                    let cell = per_sensor.and_then(|ps| ps.get(s)).and_then(|v| agg(v)).map(round);
                     row[name.as_str()] = match cell { Some(x) => serde_json::json!(x), None => serde_json::Value::Null };
                 }
             }
@@ -627,7 +659,7 @@ fn persist_aggregation(
 /// stay untouched so any downstream reference (scenario bundle, viz source)
 /// remains valid.
 #[tauri::command]
-pub fn rename_aggregation(aggregation_id: String, new_name: String) -> Result<SavedAggregationMeta, String> {
+pub async fn rename_aggregation(aggregation_id: String, new_name: String) -> Result<SavedAggregationMeta, String> {
     let new_name = new_name.trim().to_string();
     if new_name.is_empty() {
         return Err("Le nom ne peut pas être vide.".to_string());
@@ -649,7 +681,15 @@ pub fn rename_aggregation(aggregation_id: String, new_name: String) -> Result<Sa
 }
 
 #[tauri::command]
-pub fn list_aggregations() -> Result<Vec<SavedAggregationMeta>, String> {
+pub async fn list_aggregations() -> Result<Vec<SavedAggregationMeta>, String> {
+    list_aggregations_inner()
+}
+
+/// Same listing, callable from other Rust code. The command above is `async`
+/// so Tauri runs it off the main thread (a synchronous command blocks the GTK
+/// event loop, which costs us the Wayland connection); callers inside the crate
+/// need the plain function.
+pub fn list_aggregations_inner() -> Result<Vec<SavedAggregationMeta>, String> {
     let root = aggregations_root();
     let mut out = Vec::new();
     if !root.exists() {
@@ -671,7 +711,7 @@ pub fn list_aggregations() -> Result<Vec<SavedAggregationMeta>, String> {
 }
 
 #[tauri::command]
-pub fn load_aggregation(aggregation_id: String) -> Result<serde_json::Value, String> {
+pub async fn load_aggregation(aggregation_id: String) -> Result<serde_json::Value, String> {
     let dir = aggregations_root().join(&aggregation_id);
     let meta_path = dir.join("meta.json");
     let result_path = dir.join("result.json");
@@ -734,7 +774,7 @@ pub(crate) fn aggregation_as_df(id: &str) -> anyhow::Result<(String, polars::pre
 }
 
 #[tauri::command]
-pub fn delete_aggregation(
+pub async fn delete_aggregation(
     state: State<'_, AppState>,
     aggregation_id: String,
 ) -> Result<(), String> {
@@ -749,4 +789,64 @@ pub fn delete_aggregation(
         format!("Agrégation supprimée : {}", aggregation_id),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod bucket_rules_tests {
+    use super::*;
+    use polars::prelude::*;
+
+    /// One day at a half-hourly step, `vals` in order from 00:00.
+    fn frame(vals: Vec<Option<f64>>) -> DataFrame {
+        let base = 1_704_067_200_000_000i64; // 2024-01-01T00:00:00Z, microseconds
+        let ts: Vec<i64> = (0..vals.len() as i64).map(|i| base + i * 30 * 60_000_000).collect();
+        let ts_s = Series::new("TIMESTAMP".into(), ts)
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
+            .unwrap();
+        DataFrame::new(vec![ts_s, Series::new("Fd_1".into(), vals)]).unwrap()
+    }
+
+    fn day_sum(df: &DataFrame, min_count: usize, scale: f64) -> serde_json::Value {
+        let cols = vec!["Fd_1".to_string()];
+        aggregate_inner(df, &cols, "Journalier", "Somme", None, None, "t", false, None, None, min_count, scale)
+            .unwrap()
+    }
+
+    fn first_value(v: &serde_json::Value) -> serde_json::Value {
+        v["rows"][0]["Fd_1"].clone()
+    }
+
+    #[test]
+    fn without_a_minimum_a_partial_day_still_reports_its_partial_total() {
+        let df = frame(vec![Some(1.0), Some(2.0), None, None]);
+        assert_eq!(first_value(&day_sum(&df, 0, 1.0)), serde_json::json!(3.0));
+    }
+
+    #[test]
+    fn a_day_below_the_minimum_reports_nothing_rather_than_a_fragment() {
+        // Three valid steps where four are required: the total would look like
+        // a real daily figure on the same axis as complete days.
+        let df = frame(vec![Some(1.0), Some(2.0), Some(3.0), None]);
+        assert_eq!(first_value(&day_sum(&df, 4, 1.0)), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_complete_day_passes_the_minimum() {
+        let df = frame(vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)]);
+        assert_eq!(first_value(&day_sum(&df, 4, 1.0)), serde_json::json!(10.0));
+    }
+
+    #[test]
+    fn scale_carries_the_unit_conversion() {
+        // Σ(Fd × 0.5) — half-hourly l dm⁻² h⁻¹ summed into l dm⁻² j⁻¹.
+        let df = frame(vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)]);
+        assert_eq!(first_value(&day_sum(&df, 0, 0.5)), serde_json::json!(5.0));
+    }
+
+    #[test]
+    fn the_two_rules_compose() {
+        let df = frame(vec![Some(1.0), Some(2.0), Some(3.0), None]);
+        assert_eq!(first_value(&day_sum(&df, 4, 0.5)), serde_json::Value::Null);
+        assert_eq!(first_value(&day_sum(&df, 3, 0.5)), serde_json::json!(3.0));
+    }
 }

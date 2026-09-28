@@ -46,7 +46,7 @@ pub struct SapFlowParamsInput {
 
 /// Update sap flow parameters in the backend state before running the pipeline.
 #[tauri::command]
-pub fn set_sap_flow_params(
+pub async fn set_sap_flow_params(
     state: State<'_, AppState>,
     params: SapFlowParamsInput,
 ) -> Result<(), String> {
@@ -112,8 +112,17 @@ pub async fn run_pipeline(
         }
     }
 
+    // A stage imported straight from a file (import page, "charger comme T600")
+    // is authoritative: rebuilding it from raw would discard the very data the
+    // user just brought in — and `raw_data` may well belong to an older,
+    // unrelated import. So resume from the furthest imported stage instead.
+    // `force = true` keeps its original meaning: rebuild everything from raw.
+    const STAGES: [&str; 9] =
+        ["tslope", "baseline", "delta_t", "t600", "tm", "stm", "tmi", "k", "sap_flow"];
+    let forced = force.unwrap_or(false);
+
     // 1. Clone data out of the lock — release it BEFORE heavy work
-    let (input_df, env_df, pattern, tm_method, alpha, beta, t0_smooth) = {
+    let (input_df, env_df, pattern, tm_method, alpha, beta, t0_smooth, resume_from, seed) = {
         let data = state.inner.lock().map_err(|e| e.to_string())?;
         let raw_df = data
             .raw_data
@@ -129,6 +138,31 @@ pub async fn run_pipeline(
             TmMethod::VpdPar { .. } | TmMethod::RegressionDiurne { .. } => data.env_data.clone(),
             _ => None,
         };
+        let resume_from = if forced {
+            None
+        } else {
+            data.imported_stages
+                .iter()
+                .filter_map(|name| STAGES.iter().position(|st| st == name))
+                .max()
+        };
+
+        // Carry the imported stage and everything upstream of it into the fresh
+        // result set, so the steps we skip still hold their values afterwards.
+        let mut seed = CalculationResults::default();
+        if let Some(idx) = resume_from {
+            let src = &data.results;
+            seed.tslope = src.tslope.clone();
+            if idx >= 1 { seed.baseline = src.baseline.clone(); }
+            if idx >= 2 { seed.delta_t = src.delta_t.clone(); }
+            if idx >= 3 { seed.t600 = src.t600.clone(); }
+            if idx >= 4 { seed.tm = src.tm.clone(); }
+            if idx >= 5 { seed.stm = src.stm.clone(); }
+            if idx >= 6 { seed.tmi = src.tmi.clone(); }
+            if idx >= 7 { seed.k = src.k.clone(); }
+            if idx >= 8 { seed.sap_flow = src.sap_flow.clone(); }
+        }
+
         (
             input,
             env,
@@ -137,6 +171,8 @@ pub async fn run_pipeline(
             data.sap_flow_params.alpha,
             data.sap_flow_params.beta,
             data.sap_flow_params.t0_smooth.clone(),
+            resume_from,
+            seed,
         )
     };
 
@@ -151,11 +187,45 @@ pub async fn run_pipeline(
     }
 
     // 2. Heavy work on a blocking thread — main thread stays free for UI
-    let (results, completed, errors, step_logs) = tokio::task::spawn_blocking(move || {
-        let mut results = CalculationResults::default();
+    let (results, completed, preserved, errors, step_logs) = tokio::task::spawn_blocking(move || {
+        let mut results = seed;
         let mut completed: Vec<String> = Vec::new();
+        // Steps this run did NOT compute because an imported file already
+        // provides them. Reported apart from `completed_steps` so the Calculs
+        // page can show them as kept rather than claiming it recalculated them.
+        let mut preserved: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         let mut step_logs: Vec<(LogLevel, String)> = Vec::new();
+
+        // Index of the last step to SKIP; -1 runs the whole chain.
+        let skip_upto: isize = resume_from.map_or(-1, |i| i as isize);
+        if let Some(idx) = resume_from {
+            // The Calculs page flips every step to "running" before invoking us
+            // and settles each one from `completed_steps`, `preserved_steps` or
+            // `errors`; a step in none of the three would spin forever.
+            const STEP_LABELS: [&str; 9] =
+                ["Tslope", "Baseline", "DeltaT", "T600", "T0", "sT0", "T0i", "K", "SapFlow"];
+            let present = [
+                results.tslope.is_some(),
+                results.baseline.is_some(),
+                results.delta_t.is_some(),
+                results.t600.is_some(),
+                results.tm.is_some(),
+                results.stm.is_some(),
+                results.tmi.is_some(),
+                results.k.is_some(),
+                results.sap_flow.is_some(),
+            ];
+            for (i, label) in STEP_LABELS.iter().enumerate().take(idx + 1) {
+                if present[i] {
+                    preserved.push((*label).to_string());
+                }
+            }
+            step_logs.push((LogLevel::Info, format!(
+                "« {} » a été importé depuis un fichier : les {} première(s) étape(s) sont conservées telles quelles, le calcul reprend à la suite.",
+                STAGES[idx].to_uppercase(), idx + 1
+            )));
+        }
 
         macro_rules! run_step {
             ($name:expr, $expr:expr, $target:expr) => {
@@ -173,166 +243,203 @@ pub async fn run_pipeline(
             };
         }
 
-        // Pre-step — drop rows with a null/blank TIMESTAMP. Empty export rows
-        // have no time; ts_col_to_datetimes drops them when building the time
-        // index, which misaligns every step that maps a compacted datetime
-        // index back onto the full frame (T600 :00/:30 filter, Tm grouping) →
-        // zeroed/garbage outputs. Removing them keeps row index == time index.
-        let input_df = match timestamp_utils::drop_null_timestamp_rows(&input_df) {
-            Ok((df, n)) => {
-                if n > 0 {
-                    step_logs.push((LogLevel::Info, format!(
-                        "Pré-traitement: {} lignes sans horodatage retirées", n
-                    )));
+        // `input_df` feeds the three pre-steps below and Tslope → DeltaT, and
+        // nothing else. A run resuming further down never reads it, so skip the
+        // lot rather than spend the time and log pre-processing lines about
+        // data this run does not use.
+        let (input_df, effective_pattern) = if skip_upto >= 2 {
+            (input_df, pattern.clone())
+        } else {
+            // Pre-step — drop rows with a null/blank TIMESTAMP. Empty export rows
+            // have no time; ts_col_to_datetimes drops them when building the time
+            // index, which misaligns every step that maps a compacted datetime
+            // index back onto the full frame (T600 :00/:30 filter, Tm grouping) →
+            // zeroed/garbage outputs. Removing them keeps row index == time index.
+            let input_df = match timestamp_utils::drop_null_timestamp_rows(&input_df) {
+                Ok((df, n)) => {
+                    if n > 0 {
+                        step_logs.push((LogLevel::Info, format!(
+                            "Pré-traitement: {} lignes sans horodatage retirées", n
+                        )));
+                    }
+                    df
                 }
-                df
-            }
-            Err(e) => {
-                step_logs.push((LogLevel::Warning, format!(
-                    "Filtrage des horodatages nuls ignoré ({}): pipeline continue", e
-                )));
-                input_df
-            }
-        };
-
-        // Pre-step — drop intra-cycle extras: legacy +10 s (2019), duplicate
-        // timestamps (0 s, since ~2024-06), and backwards timestamps (< 0 s).
-        let input_df = match timestamp_utils::drop_intra_cycle_extras(&input_df) {
-            Ok((df, n)) => {
-                if n > 0 {
-                    step_logs.push((LogLevel::Info, format!(
-                        "Pré-traitement: {} lignes parasites retirées (doublons, inversions, extras legacy)",
-                        n
+                Err(e) => {
+                    step_logs.push((LogLevel::Warning, format!(
+                        "Filtrage des horodatages nuls ignoré ({}): pipeline continue", e
                     )));
+                    input_df
                 }
-                df
-            }
-            Err(e) => {
-                step_logs.push((LogLevel::Warning, format!(
-                    "Pré-traitement ignoré ({}): pipeline continue sur les données brutes", e
-                )));
-                input_df
-            }
-        };
+            };
 
-        // Pre-step — infer the heating-cycle pattern from the actual data and
-        // override the configured one if they don't match. See
-        // timestamp_utils::infer_heating_pattern. Misalignment between the
-        // configured 11-delta pattern and a 7-delta file produces zigzag T600
-        // because baseline accumulation uses the wrong delta on alternating
-        // rows.
-        let effective_pattern = match timestamp_utils::infer_heating_pattern(&input_df) {
-            Ok(Some(inferred)) if inferred != pattern => {
-                step_logs.push((LogLevel::Warning, format!(
-                    "Pattern de chauffe auto-détecté: {:?} (différent de la config {:?}) — utilisation du pattern détecté",
-                    inferred, pattern
-                )));
-                inferred
-            }
-            Ok(Some(_)) => {
-                step_logs.push((LogLevel::Info,
-                    "Pattern de chauffe auto-détecté: identique à la config".to_string()));
-                pattern.clone()
-            }
-            Ok(None) => {
-                step_logs.push((LogLevel::Info,
-                    "Pattern de chauffe non détectable (données trop courtes ou irrégulières) — pattern config utilisé".to_string()));
-                pattern.clone()
-            }
-            Err(e) => {
-                step_logs.push((LogLevel::Warning, format!(
-                    "Détection du pattern échouée ({}): pattern config utilisé", e
-                )));
-                pattern.clone()
-            }
+            // Pre-step — drop intra-cycle extras: legacy +10 s (2019), duplicate
+            // timestamps (0 s, since ~2024-06), and backwards timestamps (< 0 s).
+            let input_df = match timestamp_utils::drop_intra_cycle_extras(&input_df) {
+                Ok((df, n)) => {
+                    if n > 0 {
+                        step_logs.push((LogLevel::Info, format!(
+                            "Pré-traitement: {} lignes parasites retirées (doublons, inversions, extras legacy)",
+                            n
+                        )));
+                    }
+                    df
+                }
+                Err(e) => {
+                    step_logs.push((LogLevel::Warning, format!(
+                        "Pré-traitement ignoré ({}): pipeline continue sur les données brutes", e
+                    )));
+                    input_df
+                }
+            };
+
+            // Pre-step — infer the heating-cycle pattern from the actual data and
+            // override the configured one if they don't match. See
+            // timestamp_utils::infer_heating_pattern. Misalignment between the
+            // configured 11-delta pattern and a 7-delta file produces zigzag T600
+            // because baseline accumulation uses the wrong delta on alternating
+            // rows.
+            let effective_pattern = match timestamp_utils::infer_heating_pattern(&input_df) {
+                Ok(Some(inferred)) if inferred != pattern => {
+                    step_logs.push((LogLevel::Warning, format!(
+                        "Pattern de chauffe auto-détecté: {:?} (différent de la config {:?}) — utilisation du pattern détecté",
+                        inferred, pattern
+                    )));
+                    inferred
+                }
+                Ok(Some(_)) => {
+                    step_logs.push((LogLevel::Info,
+                        "Pattern de chauffe auto-détecté: identique à la config".to_string()));
+                    pattern.clone()
+                }
+                Ok(None) => {
+                    step_logs.push((LogLevel::Info,
+                        "Pattern de chauffe non détectable (données trop courtes ou irrégulières) — pattern config utilisé".to_string()));
+                    pattern.clone()
+                }
+                Err(e) => {
+                    step_logs.push((LogLevel::Warning, format!(
+                        "Détection du pattern échouée ({}): pattern config utilisé", e
+                    )));
+                    pattern.clone()
+                }
+            };
+            (input_df, effective_pattern)
         };
 
         // Step 1 – Tslope
-        run_step!("Tslope", calculations::calculate_tslope(&input_df, &effective_pattern), results.tslope);
+        if skip_upto < 0 {
+            run_step!("Tslope", calculations::calculate_tslope(&input_df, &effective_pattern), results.tslope);
+        }
 
         // Step 2 – Baseline
-        if let Some(ref tslope) = results.tslope {
-            run_step!("Baseline", calculations::calculate_baseline(&input_df, tslope, &effective_pattern), results.baseline);
+        if skip_upto < 1 {
+            if let Some(ref tslope) = results.tslope {
+                run_step!("Baseline", calculations::calculate_baseline(&input_df, tslope, &effective_pattern), results.baseline);
+            }
         }
 
         // Step 3 – DeltaT
-        if let Some(ref baseline) = results.baseline {
-            run_step!("DeltaT", calculations::calculate_delta_t(&input_df, baseline), results.delta_t);
+        if skip_upto < 2 {
+            if let Some(ref baseline) = results.baseline {
+                run_step!("DeltaT", calculations::calculate_delta_t(&input_df, baseline), results.delta_t);
+            }
         }
 
         // Step 4 – T600
-        if let Some(ref delta_t) = results.delta_t {
-            run_step!("T600", calculations::create_t600(delta_t), results.t600);
+        if skip_upto < 3 {
+            if let Some(ref delta_t) = results.delta_t {
+                run_step!("T600", calculations::create_t600(delta_t), results.t600);
+            }
         }
 
-        // Step 5 – Tm (also captures RegressionDiurne/VpdPar diagnostics)
-        if let Some(ref t600) = results.t600 {
-            match calculations::calculate_tm(t600, &tm_method, env_df.as_ref()) {
-                Ok(out) => {
-                    if let Some(stats) = &out.vpd_par_stats {
-                        let total = stats.n_total.max(1) as f64;
-                        step_logs.push((LogLevel::Info, format!(
-                            "VpdPar diagnostic: total={} | nuit-horloge={} ({:.0}%) | rayonnement OK={} ({:.0}%) | nuit+rayonnement={} ({:.0}%) | VPD OK={} ({:.0}%) | env-passé={} ({:.0}%) | nuits Valid={}, Interp={}, NoValid={}",
-                            stats.n_total,
-                            stats.n_in_clock_window, 100.0 * stats.n_in_clock_window as f64 / total,
-                            stats.n_rad_ok, 100.0 * stats.n_rad_ok as f64 / total,
-                            stats.n_night_flag, 100.0 * stats.n_night_flag as f64 / total,
-                            stats.n_vpd_ok, 100.0 * stats.n_vpd_ok as f64 / total,
-                            stats.n_env_passed, 100.0 * stats.n_env_passed as f64 / total,
-                            stats.n_valid_nights, stats.n_interpolated_nights, stats.n_no_valid_nights,
-                        )));
+        if skip_upto < 4 {
+            // Step 5 – Tm (also captures RegressionDiurne/VpdPar diagnostics)
+            if let Some(ref t600) = results.t600 {
+                match calculations::calculate_tm(t600, &tm_method, env_df.as_ref()) {
+                    Ok(out) => {
+                        if let Some(stats) = &out.vpd_par_stats {
+                            let total = stats.n_total.max(1) as f64;
+                            step_logs.push((LogLevel::Info, format!(
+                                "VpdPar diagnostic: total={} | nuit-horloge={} ({:.0}%) | rayonnement OK={} ({:.0}%) | nuit+rayonnement={} ({:.0}%) | VPD OK={} ({:.0}%) | env-passé={} ({:.0}%) | nuits Valid={}, Interp={}, NoValid={}",
+                                stats.n_total,
+                                stats.n_in_clock_window, 100.0 * stats.n_in_clock_window as f64 / total,
+                                stats.n_rad_ok, 100.0 * stats.n_rad_ok as f64 / total,
+                                stats.n_night_flag, 100.0 * stats.n_night_flag as f64 / total,
+                                stats.n_vpd_ok, 100.0 * stats.n_vpd_ok as f64 / total,
+                                stats.n_env_passed, 100.0 * stats.n_env_passed as f64 / total,
+                                stats.n_valid_nights, stats.n_interpolated_nights, stats.n_no_valid_nights,
+                            )));
+                        }
+                        // Optional smoothing of the final T0 (all methods, several modalities).
+                        results.tm = Some(calculations::smooth_tm(&out.df, &t0_smooth));
+                        results.diurnal_diagnostics = out.diurnal_diagnostics;
+                        results.vpd_par_stats = out.vpd_par_stats;
+                        if let Some(steps) = out.diurnal_steps {
+                            results.rd_regression = Some(steps.regression);
+                            results.rd_result = Some(steps.result);
+                        }
+                        completed.push("T0".to_string());
+                        step_logs.push((LogLevel::Info, "Step T0 OK".to_string()));
                     }
-                    // Optional smoothing of the final T0 (all methods, several modalities).
-                    results.tm = Some(calculations::smooth_tm(&out.df, &t0_smooth));
-                    results.diurnal_diagnostics = out.diurnal_diagnostics;
-                    results.vpd_par_stats = out.vpd_par_stats;
-                    if let Some(steps) = out.diurnal_steps {
-                        results.rd_regression = Some(steps.regression);
-                        results.rd_result = Some(steps.result);
+                    Err(e) => {
+                        errors.push(format!("T0: {}", e));
+                        step_logs.push((LogLevel::Warning, format!("Step T0 failed: {}", e)));
                     }
-                    completed.push("T0".to_string());
-                    step_logs.push((LogLevel::Info, "Step T0 OK".to_string()));
-                }
-                Err(e) => {
-                    errors.push(format!("T0: {}", e));
-                    step_logs.push((LogLevel::Warning, format!("Step T0 failed: {}", e)));
                 }
             }
         }
 
         // Step 6 – sTm
-        if let (Some(ref tm), Some(ref t600)) = (&results.tm, &results.t600) {
-            run_step!("sT0", calculations::calculate_stm(tm, t600), results.stm);
+        if skip_upto < 5 {
+            if let (Some(ref tm), Some(ref t600)) = (&results.tm, &results.t600) {
+                run_step!("sT0", calculations::calculate_stm(tm, t600), results.stm);
+            }
         }
 
         // Step 7 – Tmi
-        if let (Some(ref tm), Some(ref stm), Some(ref t600)) =
-            (&results.tm, &results.stm, &results.t600)
-        {
-            run_step!("T0i", calculations::calculate_tmi(tm, stm, t600), results.tmi);
+        if skip_upto < 6 {
+            if let (Some(ref tm), Some(ref stm), Some(ref t600)) =
+                (&results.tm, &results.stm, &results.t600)
+            {
+                run_step!("T0i", calculations::calculate_tmi(tm, stm, t600), results.tmi);
+            }
         }
 
         // Step 8 – K
-        if let (Some(ref tmi), Some(ref t600)) = (&results.tmi, &results.t600) {
-            run_step!("K", calculations::calculate_k(tmi, t600), results.k);
+        if skip_upto < 7 {
+            if let (Some(ref tmi), Some(ref t600)) = (&results.tmi, &results.t600) {
+                run_step!("K", calculations::calculate_k(tmi, t600), results.k);
+            }
         }
 
         // Step 9 – Sap Flow
-        if let Some(ref k) = results.k {
-            run_step!("SapFlow", calculations::calculate_sapflow(k, alpha, beta), results.sap_flow);
+        if skip_upto < 8 {
+            if let Some(ref k) = results.k {
+                run_step!("SapFlow", calculations::calculate_sapflow(k, alpha, beta), results.sap_flow);
+            }
         }
 
-        (results, completed, errors, step_logs)
+        (results, completed, preserved, errors, step_logs)
     })
     .await
     .map_err(|e| e.to_string())?;
 
     // 3. Store results back in state (brief lock)
-    let msg = format!(
-        "Pipeline complete: {} steps done, {} errors",
-        completed.len(),
-        errors.len()
-    );
+    let msg = if preserved.is_empty() {
+        format!(
+            "Pipeline complete: {} steps done, {} errors",
+            completed.len(),
+            errors.len()
+        )
+    } else {
+        format!(
+            "Calcul terminé : {} étape(s) calculée(s), {} conservée(s) telles qu'importées ({}), {} erreur(s)",
+            completed.len(),
+            preserved.len(),
+            preserved.join(", "),
+            errors.len()
+        )
+    };
 
     // Surface any VpdPar diagnostic line in the response so the frontend can
     // route it to its own Journal. (Rust's `data.logs` is NOT synced to the
@@ -396,6 +503,22 @@ pub async fn run_pipeline(
             );
         }
 
+        // A forced run rebuilds every stage from raw, so a file that had been
+        // imported as a stage has just been overwritten — stop claiming it is
+        // still in play, or the next run would "resume" from a stage that no
+        // longer holds the imported data.
+        if forced && !data.imported_stages.is_empty() {
+            let dropped = std::mem::take(&mut data.imported_stages);
+            logger::add_log(
+                &mut data.logs,
+                LogLevel::Warning,
+                format!(
+                    "Recalcul complet depuis les données brutes : les étapes importées depuis un fichier ({}) ont été remplacées par des valeurs recalculées.",
+                    dropped.join(", ")
+                ),
+            );
+        }
+
         // Replay step logs
         for (level, msg) in step_logs {
             logger::add_log(&mut data.logs, level, msg);
@@ -411,6 +534,7 @@ pub async fn run_pipeline(
     Ok(serde_json::json!({
         "message": msg,
         "completed_steps": completed,
+        "preserved_steps": preserved,
         "errors": errors,
         "vpd_par_diagnostic": vpd_par_diagnostic,
     }))
@@ -602,7 +726,7 @@ pub struct TtdPlusParamsInput {
 }
 
 #[tauri::command]
-pub fn set_ttdplus_params(
+pub async fn set_ttdplus_params(
     state: State<'_, AppState>,
     params: TtdPlusParamsInput,
 ) -> Result<(), String> {
@@ -670,7 +794,7 @@ pub async fn run_ttdplus_pipeline(
 /// was computed during the last pipeline run. Used by the CalculsPage to
 /// populate the date/column pickers above the inspection charts.
 #[tauri::command]
-pub fn list_diurnal_regression_diagnostics(
+pub async fn list_diurnal_regression_diagnostics(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let data = state.inner.lock().map_err(|e| e.to_string())?;
@@ -687,7 +811,7 @@ pub fn list_diurnal_regression_diagnostics(
 
 /// Fetch one diagnostic entry (one night × one T600 column).
 #[tauri::command]
-pub fn get_diurnal_regression_diagnostic(
+pub async fn get_diurnal_regression_diagnostic(
     state: State<'_, AppState>,
     date: String,
     column: String,
@@ -712,7 +836,7 @@ pub fn get_diurnal_regression_diagnostic(
 /// Also returns the persisted groups so the frontend can re-render the user's
 /// previous configuration on app reload.
 #[tauri::command]
-pub fn list_advanced_sensors(
+pub async fn list_advanced_sensors(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let data = state.inner.lock().map_err(|e| e.to_string())?;
@@ -757,7 +881,7 @@ pub struct AdvancedGroupInput {
 /// `CalculationResults` and persists the group definitions in
 /// `AppData::advanced_groups` so they survive a restart.
 #[tauri::command]
-pub fn compute_advanced_chain(
+pub async fn compute_advanced_chain(
     state: State<'_, AppState>,
     groups: Vec<AdvancedGroupInput>,
 ) -> Result<serde_json::Value, String> {

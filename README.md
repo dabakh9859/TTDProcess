@@ -25,6 +25,18 @@ Développée pour le suivi de *Faidherbia albida* sur les stations de Niakhar
 
 Interface bilingue français / anglais, thèmes clair et sombre.
 
+## Style de l’interface
+
+Le thème sobre ardoise / bleu est défini dans `public/professional.css`, partagé
+par le frontend historique et les sources React. Pour appliquer une modification
+du style à l’application complète, exécuter `npm run ui:apply`, puis relancer
+`./linux.sh` (ou recompiler Tauri). Cette commande conserve le JavaScript métier
+de `dist/`. `./linux.sh originale` réapplique également le thème après restauration.
+
+Attention : `npm run build` reconstruit l’interface React encore incomplète et
+remplace le frontend historique. Ne pas l’utiliser pour une simple modification
+du thème de l’application complète.
+
 ## Architecture
 
 | Couche | Technologie |
@@ -92,7 +104,7 @@ dist/                     frontend compilé
 
 ## État du projet
 
-Le cœur Rust et le service Python sont complets et fonctionnels : 88 commandes
+Le cœur Rust et le service Python sont complets et fonctionnels : 93 commandes
 exposées, chaîne de calcul entière, entraînement et comblement opérationnels.
 
 Le frontend est **en cours de réécriture**. Le socle est en place — mise en page,

@@ -113,9 +113,28 @@ explications     — (documentation statique)
 parametres       set_sap_flow_params
 ```
 
+## Commandes ajoutées après la récupération
+
+Le backend expose aujourd'hui **93** commandes (88 au moment de la récupération).
+Les 5 nouvelles, ajoutées en septembre 2026 :
+
+| Commande | Fichier Rust | Appelée par `dist/` | Vue |
+|---|---|---|---|
+| `delete_model` | `commands/ml.rs` | oui | suppression d'un modèle (`kind === "ml"`) |
+| `ai_model_delete` | `commands/ai.rs` | oui | suppression d'un modèle SAITS |
+| `export_data_multi_files` | `commands/export.rs` | oui | `export` — un fichier par jeu de données dans un dossier |
+| `cleaning_origin_flags` | `commands/cleaning_v2.rs` | non | — |
+| `export_origin_flags` | `commands/cleaning_v2.rs` | non | — |
+
+⚠️ Les trois premières sont appelées par le bundle `dist/assets/index-0nLOWM5B.js`,
+qui a été **patché à la main** le 22/09/2026 (il n'est plus identique à
+`recovered/dist-original/`). Ces appels n'existent dans aucune source : ils sont à
+réécrire dans les vues React correspondantes. Pour les retrouver dans le bundle :
+chercher le nom de la commande.
+
 ## Commandes backend jamais appelées
 
-17 des 88 commandes exposées par Rust n'apparaissent nulle part dans le bundle :
+17 des 88 commandes d'origine n'apparaissent nulle part dans le bundle :
 
 ```
 train_model  predict  list_models  save_model  load_model        ← ancien moteur ML natif
