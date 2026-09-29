@@ -40,3 +40,7 @@ Thumbs.db
 # Environnement Python du sidecar IA sous Linux (4,7 Go)
 # Recréer avec : python3.11 -m venv .venv-ttd-ai && .venv-ttd-ai/bin/pip install torch --index-url https://download.pytorch.org/whl/cu126 && .venv-ttd-ai/bin/pip install pypots openpyxl pandas scikit-learn scipy
 .venv-ttd-ai/
+
+# Sauvegardes locales
+*.avant-*
+.venv-ttd-ai.broken/

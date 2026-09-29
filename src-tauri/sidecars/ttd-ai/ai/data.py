@@ -39,8 +39,15 @@ def _to_datetime(values: pd.Series) -> pd.Series:
     if is_dt.any():
         out.loc[is_dt] = pd.to_datetime(values[is_dt].tolist())
     if (~is_dt).any():
-        serials = pd.to_numeric(values[~is_dt], errors="coerce")
+        rest = values[~is_dt]
+        serials = pd.to_numeric(rest, errors="coerce")
         out.loc[~is_dt] = EXCEL_EPOCH + pd.to_timedelta(serials, unit="D")
+        # Text timestamps (CSV exports: "2019-04-10T18:30:00.000000",
+        # "2019-04-10 18:30:00") are neither datetime objects nor Excel serials
+        # and used to come out as NaT — the whole table was then dropped.
+        text = serials.isna() & rest.notna()
+        if text.any():
+            out.loc[text[text].index] = pd.to_datetime(rest[text].astype(str), errors="coerce", format="mixed")
     return out
 
 

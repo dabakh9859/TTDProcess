@@ -44,6 +44,9 @@ fn resolve_dataset(
         "jhp" => cloned(app.results.jhp.as_ref()),
         "qh" => cloned(app.results.qh.as_ref()),
         "qd" => cloned(app.results.qd.as_ref()),
+        // Ad-hoc files opened with `viz_load_file` (Visualisation or the
+        // Agrégation "Importer" button) — never part of the pipeline.
+        k if k.starts_with("file:") => app.viz_files.get(&k["file:".len()..]).map(|vf| vf.df.clone()),
         _ => None,
     }
 }
@@ -71,6 +74,17 @@ pub async fn list_aggregation_sources(
                 "columns": df.get_column_names().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             }));
         }
+    }
+    // Imported files, after the pipeline datasets so they never become the
+    // default selection.
+    for (id, vf) in &app.viz_files {
+        out.push(serde_json::json!({
+            "key": format!("file:{}", id),
+            "label": vf.label,
+            "rows": vf.df.height(),
+            "cols": vf.df.width(),
+            "columns": vf.df.get_column_names().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        }));
     }
     Ok(serde_json::json!({ "sources": out }))
 }
@@ -111,19 +125,50 @@ pub async fn aggregate_data(
     // needs: summing 48 half-hourly values of l dm⁻² h⁻¹ gives l dm⁻² j⁻¹ only
     // after ×0.5, and doing it by hand on every export invites mistakes.
     scale: Option<f64>,
+    // "Par classes" mode (profile = "Bins", profile_by = variable): width of a
+    // class of the grouping variable, and optional filters that keep only
+    // some hours of the day / months of the year before grouping.
+    bin_width: Option<f64>,
+    hour_from: Option<u32>,
+    hour_to: Option<u32>,
+    months: Option<Vec<u32>>,
 ) -> Result<serde_json::Value, String> {
     // Resolve dataset under a short lock then release.
-    let (df, dataset_key) = {
+    let (df, dataset_key, bin_source) = {
         let app = state.inner.lock().map_err(|e| e.to_string())?;
         let key = dataset.unwrap_or_else(|| "sap_flow".to_string());
         // Fall back through sap_flow → cleaned → raw when the requested key
         // is empty, mirroring the historical default.
+        // An imported file that vanished must not silently fall back to the
+        // pipeline: the user would aggregate data they did not pick.
+        if key.starts_with("file:") && resolve_dataset(&app, &key).is_none() {
+            return Err("Fichier importé introuvable — réimporte-le.".to_string());
+        }
         let df = resolve_dataset(&app, &key)
             .or_else(|| resolve_dataset(&app, "sap_flow"))
             .or_else(|| resolve_dataset(&app, "cleaned"))
             .or_else(|| resolve_dataset(&app, "raw"))
             .ok_or_else(|| format!("Dataset '{}' indisponible ou pipeline non lancé.", key))?;
-        (df, key)
+        // The grouping variable of the "Par classes" mode is read from the
+        // dataset itself when it has that column, otherwise from the loaded
+        // environmental data (VPD, Rn… live there).
+        let bin_source = if profile.as_deref() == Some("Bins") {
+            let var = profile_by.clone().filter(|v| !v.is_empty())
+                .ok_or_else(|| "Choisis la variable qui définit les classes.".to_string())?;
+            if df.get_column_names().iter().any(|c| c.to_string() == var) {
+                None
+            } else {
+                let env = app.env_data.as_ref().ok_or_else(|| format!(
+                    "La variable « {} » n'est ni dans les données choisies ni dans les données environnementales : charge d'abord le fichier météo (onglet Données env.).", var))?;
+                if !env.get_column_names().iter().any(|c| c.to_string() == var) {
+                    return Err(format!("La variable « {} » est introuvable dans les données environnementales.", var));
+                }
+                Some(env.clone())
+            }
+        } else {
+            None
+        };
+        (df, key, bin_source)
     };
 
     let columns_clone = columns.clone();
@@ -135,12 +180,18 @@ pub async fn aggregate_data(
     let profile_opt = profile.as_deref().filter(|p| !p.is_empty() && *p != "none").map(String::from);
     let profile_clone = profile_opt.clone();
     let profile_by_clone = profile_by.clone();
+    let bins = BinOptions {
+        width: bin_width.unwrap_or(5.0),
+        hour_from, hour_to,
+        months: months.unwrap_or_default(),
+        env: bin_source,
+    };
     let result_json = tokio::task::spawn_blocking(move || {
         aggregate_inner(
             &df, &columns_clone, &period_clone, &operation_clone,
             custom_days, custom_seconds, &dataset_key_for_inner, cross_sensor,
             profile_clone.as_deref(), profile_by_clone.as_deref(),
-            min_count.unwrap_or(0), scale.unwrap_or(1.0),
+            min_count.unwrap_or(0), scale.unwrap_or(1.0), &bins,
         )
     })
     .await
@@ -148,7 +199,11 @@ pub async fn aggregate_data(
 
     // Human label for the "period" shown in the saved list / header. In
     // profile mode it reflects the diurnal-profile grouping.
-    let period_label = if profile_opt.is_some() {
+    let period_label = if profile_opt.as_deref() == Some("MonthOfYear") {
+        "Mois moyen".to_string()
+    } else if profile_opt.as_deref() == Some("Bins") {
+        format!("Par classes de {}", profile_by.as_deref().unwrap_or("?"))
+    } else if profile_opt.is_some() {
         let outer = match profile_by.as_deref().unwrap_or("Global") {
             "Journalier" => "jour", "Hebdomadaire" => "semaine",
             "Mensuel" => "mois", "Annuel" => "année", _ => "tout le fichier",
@@ -214,6 +269,7 @@ fn aggregate_inner(
     profile_by: Option<&str>,
     min_count: usize,
     scale: f64,
+    bins: &BinOptions,
 ) -> Result<serde_json::Value, String> {
     // Find the timestamp column. Qd uses DATE (Polars Date) — every other
     // dataset uses TIMESTAMP (datetime). Both branches end up as strings of
@@ -259,6 +315,21 @@ fn aggregate_inner(
     // Profile (diurnal-dynamics) mode → pivoted output: rows = hour-of-day,
     // one column (curve) per outer group (week/month/…). Returns early so the
     // Visualisation tab can overlay the curves on a synthetic time-of-day axis.
+    if profile == Some("MonthOfYear") {
+        return aggregate_month_of_year(&ts_vec, &col_data, columns, operation, cross_sensor, min_count, scale);
+    }
+    if profile == Some("Bins") {
+        let var = profile_by.unwrap_or_default();
+        let bin_vals: Vec<f64> = match &bins.env {
+            None => df.column(var)
+                .and_then(|c| c.cast(&polars::prelude::DataType::Float64))
+                .map_err(|e| e.to_string())?
+                .f64().map_err(|e| e.to_string())?
+                .into_iter().map(|v| v.unwrap_or(f64::NAN)).collect(),
+            Some(env) => align_env_column(env, var, &ts_vec)?,
+        };
+        return aggregate_bins(&ts_vec, &col_data, columns, operation, cross_sensor, min_count, scale, var, &bin_vals, bins);
+    }
     if profile.is_some() {
         return aggregate_profile(&ts_vec, &col_data, columns, operation, profile_by, cross_sensor, min_count, scale);
     }
@@ -284,21 +355,23 @@ fn aggregate_inner(
 
     let mut result_rows: Vec<serde_json::Value> = Vec::new();
 
-    for group in &all_groups {
+    // Bucket the rows once (group → row indices). Filtering every row for
+    // every group was O(groups × rows): minutes on a daily sum of six years.
+    let group_pos: HashMap<&str, usize> = all_groups.iter().enumerate().map(|(i, g)| (g.as_str(), i)).collect();
+    let mut rows_of: Vec<Vec<usize>> = vec![Vec::new(); all_groups.len()];
+    for (i, k) in group_keys.iter().enumerate() {
+        rows_of[group_pos[k.as_str()]].push(i);
+    }
+
+    for (gi, group) in all_groups.iter().enumerate() {
         let mut row = serde_json::json!({ "period": group });
 
         for col_name in columns {
             if let Some(col_vals) = col_data.get(col_name) {
-                let vals: Vec<f64> = group_keys
+                let vals: Vec<f64> = rows_of[gi]
                     .iter()
-                    .zip(col_vals.iter())
-                    .filter_map(|(k, &v)| {
-                        if k == group && v.is_finite() {
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    })
+                    .map(|&i| col_vals[i])
+                    .filter(|v| v.is_finite())
                     .collect();
 
                 // Below the required count the bucket is incomplete: report
@@ -491,6 +564,229 @@ fn aggregate_profile(
         "profile_by": by,
         "rows": rows,
         "total": hours.len(),
+    }))
+}
+
+/// Options of the "Par classes" mode, bundled to keep `aggregate_inner` readable.
+#[derive(Default)]
+pub(crate) struct BinOptions {
+    pub width: f64,
+    pub hour_from: Option<u32>,
+    pub hour_to: Option<u32>,
+    pub months: Vec<u32>,
+    /// Environmental frame holding the grouping variable, when it is not a
+    /// column of the aggregated dataset itself.
+    pub env: Option<polars::prelude::DataFrame>,
+}
+
+fn apply_op(operation: &str, vals: &[f64]) -> f64 {
+    match operation {
+        "Somme" => vals.iter().sum::<f64>(),
+        "Minimum" => vals.iter().cloned().fold(f64::INFINITY, f64::min),
+        "Maximum" => vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        _ => vals.iter().sum::<f64>() / vals.len() as f64,
+    }
+}
+
+fn round4(v: f64) -> serde_json::Value {
+    if v.is_finite() { serde_json::json!((v * 10000.0).round() / 10000.0) } else { serde_json::Value::Null }
+}
+
+/// Minutes since the epoch, rounded to the nearest half-hour, for any of the
+/// timestamp spellings the app meets ("2019-04-10T18:30:00.000000",
+/// "2019-04-10 18:30:00", "2019-04-10"). Sap-flow timestamps sit at the peak of
+/// the heating cycle, a few minutes off the grid, so an exact match with the
+/// weather file would miss most rows.
+fn half_hour_key(s: &str) -> Option<i64> {
+    let s = s.replace('T', " ");
+    let dt = if s.len() >= 16 {
+        chrono::NaiveDateTime::parse_from_str(&s[..16], "%Y-%m-%d %H:%M").ok()?
+    } else if s.len() >= 10 {
+        chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0)?
+    } else {
+        return None;
+    };
+    let m = dt.and_utc().timestamp().div_euclid(60);
+    Some((m + 15).div_euclid(30) * 30)
+}
+
+/// Values of `var` from the environmental frame, re-aligned on the rows of
+/// the aggregated dataset (by half-hour).
+fn align_env_column(env: &polars::prelude::DataFrame, var: &str, ts_vec: &[&str]) -> Result<Vec<f64>, String> {
+    let ts_name = env.get_column_names().into_iter()
+        .find(|n| { let u = n.to_uppercase(); u == "TIMESTAMP" || u == "DATE" })
+        .map(|n| n.to_string())
+        .ok_or_else(|| "Colonne TIMESTAMP introuvable dans les données environnementales.".to_string())?;
+    let ts = env.column(&ts_name).map_err(|e| e.to_string())?
+        .cast(&polars::prelude::DataType::String).map_err(|e| e.to_string())?;
+    let vals = env.column(var).map_err(|e| e.to_string())?
+        .cast(&polars::prelude::DataType::Float64).map_err(|e| e.to_string())?;
+    let mut map: HashMap<i64, f64> = HashMap::new();
+    for (t, v) in ts.str().map_err(|e| e.to_string())?.into_iter().zip(vals.f64().map_err(|e| e.to_string())?.into_iter()) {
+        if let (Some(t), Some(v)) = (t, v) {
+            if v.is_finite() {
+                if let Some(k) = half_hour_key(t) { map.insert(k, v); }
+            }
+        }
+    }
+    Ok(ts_vec.iter().map(|s| half_hour_key(s).and_then(|k| map.get(&k).copied()).unwrap_or(f64::NAN)).collect())
+}
+
+/// "Mois moyen": one row per calendar month (January → December). Each day is
+/// first reduced with `operation` (with `min_count` and `scale` applied at the
+/// day level, exactly like the "Jour" period), then the days of that calendar
+/// month are averaged over every year. With Somme / 48 / ×0.5 on Fd this gives
+/// the mean daily total of each month, in l dm⁻² j⁻¹.
+fn aggregate_month_of_year(
+    ts_vec: &[&str],
+    col_data: &HashMap<String, Vec<f64>>,
+    columns: &[String],
+    operation: &str,
+    cross_sensor: bool,
+    min_count: usize,
+    scale: f64,
+) -> Result<serde_json::Value, String> {
+    // day → column → values
+    let mut days: HashMap<String, HashMap<&str, Vec<f64>>> = HashMap::new();
+    for (i, &s) in ts_vec.iter().enumerate() {
+        if s.len() < 10 { continue; }
+        let day = days.entry(s[..10].to_string()).or_default();
+        for c in columns {
+            if let Some(&v) = col_data.get(c).and_then(|vals| vals.get(i)) {
+                if v.is_finite() { day.entry(c.as_str()).or_default().push(v); }
+            }
+        }
+    }
+    // month → column → daily values
+    let mut months: HashMap<u32, HashMap<&str, Vec<f64>>> = HashMap::new();
+    for (day, per_col) in &days {
+        let Some(m) = day.get(5..7).and_then(|m| m.parse::<u32>().ok()) else { continue };
+        for (c, vals) in per_col {
+            if vals.is_empty() || vals.len() < min_count { continue; }
+            months.entry(m).or_default().entry(*c).or_default().push(apply_op(operation, vals) * scale);
+        }
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let out_columns: Vec<String> = if cross_sensor { vec!["Moyenne_capteurs".to_string()] } else { columns.to_vec() };
+    let mut rows = Vec::new();
+    for m in 1..=12u32 {
+        let mut row = serde_json::json!({ "period": format!("2001-{:02}-15 00:00:00", m) });
+        let per_col = months.get(&m);
+        let means: Vec<(String, Option<f64>)> = columns.iter().map(|c| {
+            (c.clone(), per_col.and_then(|pc| pc.get(c.as_str())).filter(|v| !v.is_empty()).map(|v| mean(v)))
+        }).collect();
+        if cross_sensor {
+            let vals: Vec<f64> = means.iter().filter_map(|(_, v)| *v).collect();
+            row["Moyenne_capteurs"] = if vals.is_empty() { serde_json::Value::Null } else { round4(mean(&vals)) };
+        } else {
+            for (c, v) in means { row[c.as_str()] = v.map(round4).unwrap_or(serde_json::Value::Null); }
+        }
+        rows.push(row);
+    }
+    Ok(serde_json::json!({
+        "period": "Mois moyen",
+        "operation": operation,
+        "columns": out_columns,
+        "source_columns": columns,
+        "cross_sensor": cross_sensor,
+        "profile": "MonthOfYear",
+        "rows": rows,
+        "total": 12,
+    }))
+}
+
+/// "Par classes": groups the rows by classes of another variable (VPD, Rn…)
+/// instead of by time — the response curve of the flux to that variable.
+/// Output: one row per class, with the class centre and the number of points
+/// as the first two columns, then the aggregated series. `period` holds a
+/// synthetic timestamp (one minute per class) only so the rows keep the shape
+/// every chart expects; the class centre is the real x.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_bins(
+    ts_vec: &[&str],
+    col_data: &HashMap<String, Vec<f64>>,
+    columns: &[String],
+    operation: &str,
+    cross_sensor: bool,
+    min_count: usize,
+    scale: f64,
+    var: &str,
+    bin_vals: &[f64],
+    opts: &BinOptions,
+) -> Result<serde_json::Value, String> {
+    if !(opts.width > 0.0) {
+        return Err("La largeur de classe doit être positive.".to_string());
+    }
+    let keep_hour = |h: u32| match (opts.hour_from, opts.hour_to) {
+        (Some(a), Some(b)) if a < b => h >= a && h < b,
+        (Some(a), Some(b)) if a > b => h >= a || h < b, // window across midnight
+        _ => true,
+    };
+    let mut classes: HashMap<i64, HashMap<&str, Vec<f64>>> = HashMap::new();
+    let mut matched = 0usize;
+    for (i, &s) in ts_vec.iter().enumerate() {
+        let x = bin_vals.get(i).copied().unwrap_or(f64::NAN);
+        if !x.is_finite() { continue; }
+        let s2 = s.replace('T', " ");
+        if let Some(h) = s2.get(11..13).and_then(|h| h.parse::<u32>().ok()) {
+            if !keep_hour(h) { continue; }
+        }
+        if !opts.months.is_empty() {
+            match s2.get(5..7).and_then(|m| m.parse::<u32>().ok()) {
+                Some(m) if opts.months.contains(&m) => {}
+                _ => continue,
+            }
+        }
+        matched += 1;
+        let k = (x / opts.width).floor() as i64;
+        let cls = classes.entry(k).or_default();
+        for c in columns {
+            if let Some(&v) = col_data.get(c).and_then(|vals| vals.get(i)) {
+                if v.is_finite() { cls.entry(c.as_str()).or_default().push(v); }
+            }
+        }
+    }
+    if matched == 0 {
+        return Err(format!("Aucune ligne ne correspond : vérifie que « {} » couvre la même période que les données, et les filtres heures / mois.", var));
+    }
+    let centre_col = format!("{} (centre de classe)", var);
+    let count_col = "Nombre de points".to_string();
+    let mut out_columns = vec![centre_col.clone(), count_col.clone()];
+    if cross_sensor { out_columns.push("Moyenne_capteurs".to_string()); } else { out_columns.extend(columns.iter().cloned()); }
+    let min_pts = min_count.max(1);
+    let keys: Vec<i64> = classes.keys().copied().collect::<BTreeSet<_>>().into_iter().collect();
+    let base = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+    let mut rows = Vec::new();
+    for (idx, k) in keys.iter().enumerate() {
+        let cls = &classes[k];
+        let n = cls.values().map(|v| v.len()).max().unwrap_or(0);
+        if n < min_pts { continue; }
+        let ts = base + chrono::Duration::minutes(idx as i64);
+        let mut row = serde_json::json!({ "period": ts.format("%Y-%m-%d %H:%M:%S").to_string() });
+        row[centre_col.as_str()] = round4((*k as f64 + 0.5) * opts.width);
+        row[count_col.as_str()] = serde_json::json!(n);
+        let vals: Vec<(String, Option<f64>)> = columns.iter().map(|c| {
+            (c.clone(), cls.get(c.as_str()).filter(|v| v.len() >= min_pts).map(|v| apply_op(operation, v) * scale))
+        }).collect();
+        if cross_sensor {
+            let f: Vec<f64> = vals.iter().filter_map(|(_, v)| *v).collect();
+            row["Moyenne_capteurs"] = if f.is_empty() { serde_json::Value::Null } else { round4(f.iter().sum::<f64>() / f.len() as f64) };
+        } else {
+            for (c, v) in vals { row[c.as_str()] = v.map(round4).unwrap_or(serde_json::Value::Null); }
+        }
+        rows.push(row);
+    }
+    let total = rows.len();
+    Ok(serde_json::json!({
+        "period": format!("Par classes de {}", var),
+        "operation": operation,
+        "columns": out_columns,
+        "source_columns": columns,
+        "cross_sensor": cross_sensor,
+        "profile": "Bins",
+        "profile_by": var,
+        "rows": rows,
+        "total": total,
     }))
 }
 
@@ -808,7 +1104,7 @@ mod bucket_rules_tests {
 
     fn day_sum(df: &DataFrame, min_count: usize, scale: f64) -> serde_json::Value {
         let cols = vec!["Fd_1".to_string()];
-        aggregate_inner(df, &cols, "Journalier", "Somme", None, None, "t", false, None, None, min_count, scale)
+        aggregate_inner(df, &cols, "Journalier", "Somme", None, None, "t", false, None, None, min_count, scale, &BinOptions::default())
             .unwrap()
     }
 
@@ -848,5 +1144,34 @@ mod bucket_rules_tests {
         let df = frame(vec![Some(1.0), Some(2.0), Some(3.0), None]);
         assert_eq!(first_value(&day_sum(&df, 4, 0.5)), serde_json::Value::Null);
         assert_eq!(first_value(&day_sum(&df, 3, 0.5)), serde_json::json!(3.0));
+    }
+}
+
+#[cfg(test)]
+mod tests_climate_bins {
+    use super::*;
+
+    // Real-data check, skipped when the files are not on this machine.
+    fn load(path: &str) -> Option<polars::prelude::DataFrame> {
+        if !std::path::Path::new(path).exists() { return None; }
+        crate::core::data_loader::load_excel_file(path, "", 0, 1).ok()
+    }
+
+    #[test]
+    fn month_of_year_and_bins_on_niakhar2() {
+        let Some(flux) = load(&std::env::var("TTD_TEST_FLUX").unwrap_or_default()) else { return };
+        let Some(env) = load(&std::env::var("TTD_TEST_ENV").unwrap_or_default()) else { return };
+        let cols = vec!["Fd_2a-TA-1".to_string()];
+        let none = BinOptions { width: 5.0, hour_from: None, hour_to: None, months: vec![], env: None };
+        let r = aggregate_inner(&flux, &cols, "Journalier", "Somme", None, None, "t", false,
+                                Some("MonthOfYear"), None, 48, 0.5, &none).unwrap();
+        let rows = r["rows"].as_array().unwrap();
+        println!("MOY {:?}", rows.iter().map(|x| x["Fd_2a-TA-1"].as_f64()).collect::<Vec<_>>());
+        let bins = BinOptions { width: 5.0, hour_from: Some(10), hour_to: Some(16), months: vec![12, 1, 2, 3, 4], env: Some(env) };
+        let r = aggregate_inner(&flux, &cols, "Journalier", "Moyenne", None, None, "t", false,
+                                Some("Bins"), Some("VPD"), 0, 1.0, &bins).unwrap();
+        for x in r["rows"].as_array().unwrap() {
+            println!("BIN {} {} {}", x["VPD (centre de classe)"], x["Fd_2a-TA-1"], x["Nombre de points"]);
+        }
     }
 }

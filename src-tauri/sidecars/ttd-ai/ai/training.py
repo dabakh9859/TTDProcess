@@ -42,6 +42,8 @@ def run_training(params: dict[str, Any], emit: Callable[[str, dict], None]) -> d
       time_features     list[str]   any of doy/doy_sin/doy_cos/hod_sin/hod_cos
       model_config      dict        SAITS hyperparams (see defaults below)
       device            str         "auto" | "cuda" | "cpu"
+      block_mask_prob   float       probability of hiding one whole sensor per
+                                    training window (long-gap training). 0 = off
     """
     # ----- defaults & param parsing -----
     files = params["files"]
@@ -364,6 +366,32 @@ def run_training(params: dict[str, Any], emit: Callable[[str, dict], None]) -> d
 
     # ----- build & train SAITS -----
     from pypots.imputation import SAITS
+    # Optional "sensor-out" training (block_mask_prob > 0). pypots' SAITS only
+    # hides scattered points (MCAR) during training, so the model rarely sees a
+    # sensor missing for a whole window — exactly what a multi-day gap looks
+    # like. With this option, each training window additionally has one sensor
+    # hidden over the whole window with the given probability, so the masked-
+    # imputation loss is learned on that case too. 0 (default) = unchanged.
+    block_mask_prob = float(params.get("block_mask_prob") or 0.0)
+    if block_mask_prob > 0:
+        import pypots.imputation.saits.data as _sd
+        _mcar_orig = _sd.mcar
+        _n_sensors = sum(1 for c in feat_cols if not c.startswith("env_") and not c.startswith("time_"))
+        _rng = np.random.default_rng(0)
+
+        def _mcar_plus_sensor_out(X, p, *a, **k):
+            Xc = _mcar_orig(X, p, *a, **k)
+            if _n_sensors > 0 and _rng.random() < block_mask_prob:
+                import torch as _t
+                obs = ~(_t.isnan(X) if isinstance(X, _t.Tensor) else np.isnan(X))
+                cand = [i for i in range(_n_sensors) if bool(obs[:, i].any())]
+                if cand:
+                    i = int(_rng.choice(cand))
+                    Xc[:, i] = float("nan")
+            return Xc
+
+        _sd.mcar = _mcar_plus_sensor_out
+        emit("debug", {"step": "sensor_out_masking", "prob": block_mask_prob, "n_sensors": _n_sensors})
     from pypots.optim import Adam
     from pygrinder import mcar
 
@@ -434,6 +462,8 @@ def run_training(params: dict[str, Any], emit: Callable[[str, dict], None]) -> d
         saits.fit(train_set=train_set, val_set=val_set)
     finally:
         pypots_logger.removeHandler(handler)
+        if block_mask_prob > 0:
+            _sd.mcar = _mcar_orig
     train_seconds = round(time.time() - t1, 1)
     emit("train_finished", {"train_seconds": train_seconds})
 

@@ -59,6 +59,34 @@ d'utiliser PyTorch sans l'embarquer dans le binaire.
 - **Node.js 20+**
 - **WebView2** (présent d'origine sur Windows 11)
 
+Sous Windows, tout s'installe avec winget :
+
+```powershell
+winget install OpenJS.NodeJS.LTS
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+### Développer (hot reload)
+
+```powershell
+npm install
+npm run app:dev       # nouvelle interface React (src/) + Rust
+npm run app:legacy    # interface complète historique (dist/) + Rust
+```
+
+- **`app:dev`** lance Vite sur `http://localhost:1420` et ouvre l'application
+  dessus : toute modification dans `src/` est appliquée à chaud (HMR), sans
+  redémarrage. C'est le mode pour la réécriture des vues.
+- **`app:legacy`** ignore Vite et sert `dist/` tel quel (le bundle fonctionnel,
+  voir « État du projet »). Pas de HMR côté interface — c'est un fichier
+  minifié — mais c'est le mode pour tester le backend sur l'application complète.
+- Dans les deux cas, une modification d'un fichier `src-tauri/src/**/*.rs`
+  recompile et relance l'application automatiquement.
+
+La première compilation Rust prend plusieurs minutes (Polars) ; les suivantes
+sont incrémentales.
+
 ### Construire
 
 ```bash

@@ -138,7 +138,7 @@ export default function Sidebar() {
             >
               TTDProcess
             </div>
-            <div style={{ color: 'var(--text-4)', fontSize: 11 }}>v2.6.0</div>
+            <div style={{ color: 'var(--text-4)', fontSize: 11 }}>v2.7.0</div>
           </div>
         )}
       </div>

@@ -67,7 +67,7 @@ export default function TopBar() {
           color: 'var(--text-3)',
         }}
       >
-        v2.6.0
+        v2.7.0
       </span>
 
       {dataLoaded && (

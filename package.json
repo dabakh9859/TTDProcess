@@ -1,14 +1,16 @@
 {
   "name": "ttdprocess",
   "private": true,
-  "version": "2.6.0",
+  "version": "2.7.0",
   "type": "module",
   "scripts": {
     "ui:apply": "node scripts/apply-interface.mjs",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:legacy": "tauri dev --config src-tauri/tauri.legacy.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
